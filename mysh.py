@@ -20,6 +20,40 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+try:
+    from rich.console import Console as RichConsole
+    from rich.markup import escape as rich_markup_escape
+    from rich.panel import Panel as RichPanel
+    from rich.table import Table as RichTable
+
+    RICH = True
+except ImportError:
+    RichConsole = None  # type: ignore[assignment]
+    RichPanel = None  # type: ignore[assignment]
+    RichTable = None  # type: ignore[assignment]
+    rich_markup_escape = None  # type: ignore[assignment]
+    RICH = False
+
+try:
+    from prompt_toolkit import PromptSession as PromptToolkitSession
+    from prompt_toolkit.completion import Completer as PromptCompleter
+    from prompt_toolkit.completion import Completion as PromptCompletion
+    from prompt_toolkit.formatted_text import ANSI as PromptANSI
+    from prompt_toolkit.history import FileHistory as PromptFileHistory
+    from prompt_toolkit.key_binding import KeyBindings as PromptKeyBindings
+    from prompt_toolkit.patch_stdout import patch_stdout as prompt_patch_stdout
+
+    PROMPT_TOOLKIT = True
+except ImportError:
+    PromptToolkitSession = None  # type: ignore[assignment]
+    PromptCompleter = None  # type: ignore[assignment]
+    PromptCompletion = None  # type: ignore[assignment]
+    PromptANSI = None  # type: ignore[assignment]
+    PromptFileHistory = None  # type: ignore[assignment]
+    PromptKeyBindings = None  # type: ignore[assignment]
+    prompt_patch_stdout = None  # type: ignore[assignment]
+    PROMPT_TOOLKIT = False
+
 
 # -----------------------------------------------------------------------------
 # ANSI 색상과 프롬프트 테마
@@ -84,6 +118,19 @@ def color(text: str, ansi_code: str) -> str:
     return f"{ansi_code}{text}{Ansi.RESET}"
 
 
+def configure_utf8_console() -> None:
+    """Windows 콘솔에서 UTF-8 입출력을 우선 사용하도록 맞춘다."""
+    if os.name != "nt":
+        return
+
+    os.system("chcp 65001 > nul 2>&1")
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def enable_ansi_on_windows() -> None:
     """Windows 콘솔에서 colorama 없이 ANSI 이스케이프 색상을 활성화한다."""
     if os.name != "nt":
@@ -116,6 +163,16 @@ class Command:
 
 
 COMMANDS: Dict[str, Command] = {}
+
+AI_SUBCOMMAND_COMPLETIONS = (
+    "ai doctor",
+    "ai context",
+    "ai sessions",
+    "ai show",
+    "ai start",
+    "ai start codex",
+    "ai start claude",
+)
 
 
 def command(name: str, description: str) -> Callable[[CommandHandler], CommandHandler]:
@@ -366,6 +423,7 @@ class ShellContext:
     theme: str = "green"
     running: bool = True
     readline_available: bool = False
+    input_backend: str = "input"
     project_root: Path = field(default_factory=lambda: detect_project_root(Path.cwd()))
     session_store: AiSessionStore = field(init=False)
     active_profile: Optional[str] = None
@@ -418,6 +476,11 @@ def split_command_line(line: str) -> tuple[str, str]:
     name = parts[0]
     raw_args = parts[1] if len(parts) > 1 else ""
     return name, raw_args
+
+
+def normalize_input_line(line: str) -> str:
+    """PowerShell 파이프 등에서 첫 입력 앞에 붙을 수 있는 UTF-8 BOM을 제거한다."""
+    return line.strip().lstrip("\ufeff")
 
 
 def strip_outer_quotes(text: str) -> str:
@@ -543,8 +606,90 @@ def execute_line(ctx: ShellContext, line: str) -> None:
 
 
 # -----------------------------------------------------------------------------
-# readline 지원: 위/아래 히스토리와 Tab 자동완성
+# 입력 지원: prompt_toolkit 우선, 없으면 readline/input fallback
 # -----------------------------------------------------------------------------
+
+
+def command_completion_candidates(ctx: ShellContext) -> List[str]:
+    """등록 명령어, 별칭, 자주 쓰는 ai 하위 명령을 자동완성 후보로 만든다."""
+    return sorted(set(COMMANDS) | set(ctx.aliases) | set(AI_SUBCOMMAND_COMPLETIONS))
+
+
+class MyshPromptCompleter(PromptCompleter if PromptCompleter is not None else object):  # type: ignore[misc, valid-type]
+    """prompt_toolkit용 동적 자동완성기."""
+
+    def __init__(self, ctx: ShellContext):
+        self.ctx = ctx
+
+    def get_completions(self, document: Any, complete_event: Any) -> Any:
+        _ = complete_event
+        if PromptCompletion is None:
+            return
+
+        raw_prefix = document.text_before_cursor
+        prefix = raw_prefix.lstrip()
+        lowered_prefix = prefix.lower()
+        for candidate in command_completion_candidates(self.ctx):
+            if candidate.lower().startswith(lowered_prefix):
+                yield PromptCompletion(candidate, start_position=-len(prefix))
+
+
+def prompt_history_path(ctx: ShellContext) -> Optional[Path]:
+    """prompt_toolkit 영속 히스토리 파일 경로를 준비한다."""
+    try:
+        ctx.session_store.ensure_store_dir()
+    except OSError:
+        return None
+    return ctx.session_store.store_dir / "history.txt"
+
+
+def prompt_key_bindings() -> Optional[Any]:
+    """Enter는 실행, Esc+Enter는 줄바꿈으로 쓰는 prompt_toolkit 키 설정."""
+    if PromptKeyBindings is None:
+        return None
+
+    bindings = PromptKeyBindings()
+
+    @bindings.add("enter")
+    def _(event: Any) -> None:
+        event.current_buffer.validate_and_handle()
+
+    @bindings.add("escape", "enter")
+    def _(event: Any) -> None:
+        event.current_buffer.insert_text("\n")
+
+    return bindings
+
+
+def setup_prompt_toolkit(ctx: ShellContext) -> Optional[Any]:
+    """prompt_toolkit이 있으면 히스토리/자동완성/멀티라인 입력 세션을 만든다."""
+    if not PROMPT_TOOLKIT or PromptToolkitSession is None:
+        return None
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return None
+
+    history = None
+    if PromptFileHistory is not None:
+        history_file = prompt_history_path(ctx)
+        if history_file is not None:
+            history = PromptFileHistory(str(history_file))
+
+    try:
+        session = PromptToolkitSession(
+            completer=MyshPromptCompleter(ctx),
+            complete_while_typing=False,
+            enable_history_search=True,
+            history=history,
+            key_bindings=prompt_key_bindings(),
+            multiline=True,
+            prompt_continuation="... ",
+        )
+    except Exception:
+        ctx.input_backend = "input"
+        return None
+
+    ctx.input_backend = "prompt_toolkit"
+    return session
 
 
 def setup_readline(ctx: ShellContext) -> None:
@@ -556,9 +701,14 @@ def setup_readline(ctx: ShellContext) -> None:
         return
 
     ctx.readline_available = True
+    ctx.input_backend = "readline"
 
     def completer(text: str, state: int) -> Optional[str]:
-        options = sorted(set(COMMANDS) | set(ctx.aliases))
+        line_buffer = readline.get_line_buffer().lstrip()
+        if line_buffer.startswith("ai "):
+            options = sorted({item[len("ai ") :] for item in AI_SUBCOMMAND_COMPLETIONS})
+        else:
+            options = sorted(set(COMMANDS) | set(ctx.aliases))
         matches = [item for item in options if item.startswith(text)]
         if state < len(matches):
             return matches[state] + " "
@@ -580,6 +730,20 @@ def add_readline_history(line: str) -> None:
     except ImportError:
         return
     readline.add_history(line)
+
+
+def read_shell_line(ctx: ShellContext, prompt_session: Optional[Any]) -> str:
+    """설정된 입력 백엔드에서 한 명령을 읽는다."""
+    prompt_text = make_prompt(ctx)
+    if prompt_session is None:
+        return input(prompt_text)
+
+    prompt_value: Any = PromptANSI(prompt_text) if PromptANSI is not None else prompt_text
+    if prompt_patch_stdout is None:
+        return prompt_session.prompt(prompt_value)
+
+    with prompt_patch_stdout():
+        return prompt_session.prompt(prompt_value)
 
 
 # -----------------------------------------------------------------------------
@@ -657,7 +821,42 @@ def status_text(status: str) -> str:
     return status
 
 
+def rich_console() -> Optional[Any]:
+    if not RICH or RichConsole is None:
+        return None
+    return RichConsole()
+
+
+def rich_escape(text: Any) -> str:
+    value = str(text)
+    if rich_markup_escape is None:
+        return value
+    return rich_markup_escape(value)
+
+
+def rich_status_text(status: str) -> str:
+    escaped = rich_escape(status)
+    if status == STATUS_OK:
+        return f"[green]{escaped}[/green]"
+    if status == STATUS_WARN:
+        return f"[yellow]{escaped}[/yellow]"
+    if status == STATUS_NONE:
+        return f"[dim]{escaped}[/dim]"
+    return escaped
+
+
 def print_status_table(rows: List[tuple[str, str, str]]) -> None:
+    console = rich_console()
+    if console is not None and RichTable is not None:
+        table = RichTable(show_header=True, header_style="bold")
+        table.add_column("항목", no_wrap=True)
+        table.add_column("상태", no_wrap=True)
+        table.add_column("세부")
+        for name, status, detail in rows:
+            table.add_row(rich_escape(name), rich_status_text(status), rich_escape(detail))
+        console.print(table)
+        return
+
     name_width = max([len("항목"), *(len(name) for name, _, _ in rows)])
     status_width = max([len("상태"), *(len(status) for _, status, _ in rows)])
     print(f"{'항목':<{name_width}}  {'상태':<{status_width}}  세부")
@@ -1096,6 +1295,27 @@ def print_ai_sessions(sessions: List[AiSession]) -> None:
         print("(저장된 AI 세션 없음)")
         return
 
+    console = rich_console()
+    if console is not None and RichTable is not None:
+        table = RichTable(title="AI Sessions", show_header=True, header_style="bold")
+        table.add_column("id", no_wrap=True)
+        table.add_column("tool", no_wrap=True)
+        table.add_column("title")
+        table.add_column("cwd")
+        table.add_column("updated_at", no_wrap=True)
+        table.add_column("exit", no_wrap=True)
+        for session in sorted(sessions, key=lambda item: item.updated_at, reverse=True):
+            table.add_row(
+                rich_escape(session.id),
+                rich_escape(session.tool),
+                rich_escape(shorten(session.title, 28)),
+                rich_escape(shorten(session.cwd, 36)),
+                rich_escape(session.updated_at),
+                rich_escape("-" if session.exit_code is None else session.exit_code),
+            )
+        console.print(table)
+        return
+
     rows = []
     for session in sorted(sessions, key=lambda item: item.updated_at, reverse=True):
         rows.append(
@@ -1114,6 +1334,22 @@ def print_ai_sessions(sessions: List[AiSession]) -> None:
 
 
 def print_ai_session_detail(session: AiSession) -> None:
+    console = rich_console()
+    if console is not None and RichPanel is not None:
+        lines = [
+            f"[bold]id[/bold]: {rich_escape(session.id)}",
+            f"[bold]title[/bold]: {rich_escape(session.title)}",
+            f"[bold]tool[/bold]: {rich_escape(session.tool)}",
+            f"[bold]cwd[/bold]: {rich_escape(session.cwd)}",
+            f"[bold]command[/bold]: {rich_escape(session.command)}",
+            f"[bold]profile[/bold]: {rich_escape(session.profile or '-')}",
+            f"[bold]created_at[/bold]: {rich_escape(session.created_at)}",
+            f"[bold]updated_at[/bold]: {rich_escape(session.updated_at)}",
+            f"[bold]exit_code[/bold]: {rich_escape('-' if session.exit_code is None else session.exit_code)}",
+        ]
+        console.print(RichPanel("\n".join(lines), title="AI Session"))
+        return
+
     print(f"id: {session.id}")
     print(f"title: {session.title}")
     print(f"tool: {session.tool}")
@@ -1381,20 +1617,25 @@ def cmd_exit(ctx: ShellContext, args: List[str], raw_args: str) -> None:
 def print_welcome(ctx: ShellContext) -> None:
     print(color("mysh에 오신 것을 환영합니다.", Ansi.BRIGHT_GREEN))
     print("help를 입력하면 명령어 목록을 볼 수 있습니다. exit 또는 quit로 종료합니다.")
-    if not ctx.readline_available:
+    if ctx.input_backend == "prompt_toolkit":
+        print(color("prompt_toolkit 입력 모드: 영속 히스토리, Tab 자동완성, 멀티라인을 사용합니다.", Ansi.DIM))
+    elif not ctx.readline_available:
         print(color("참고: 이 환경에서는 readline 히스토리/Tab 자동완성이 비활성화되었습니다.", Ansi.DIM))
 
 
 def main() -> int:
+    configure_utf8_console()
     enable_ansi_on_windows()
 
     ctx = ShellContext()
-    setup_readline(ctx)
+    prompt_session = setup_prompt_toolkit(ctx)
+    if prompt_session is None:
+        setup_readline(ctx)
     print_welcome(ctx)
 
     while ctx.running:
         try:
-            line = input(make_prompt(ctx))
+            line = read_shell_line(ctx, prompt_session)
         except KeyboardInterrupt:
             print("^C")
             continue
@@ -1402,12 +1643,12 @@ def main() -> int:
             print()
             break
 
-        line = line.strip()
+        line = normalize_input_line(line)
         if not line:
             continue
 
         ctx.history.append(line)
-        if ctx.readline_available:
+        if ctx.input_backend == "readline":
             add_readline_history(line)
 
         try:

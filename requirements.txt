@@ -1,0 +1,4 @@
+# Optional dependencies for enhanced interactive input/output.
+# mysh.py still runs without installing anything from this file.
+rich
+prompt_toolkit

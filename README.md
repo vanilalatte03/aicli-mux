@@ -4,11 +4,26 @@
 
 ## 실행
 
+### 기본 실행(의존성 0)
+
+외부 패키지 설치 없이 바로 실행할 수 있습니다. 이 경로에서는 Python 표준 라이브러리만 사용하며, 기존 `input()`/`readline` 기반 입력과 plain 텍스트 출력으로 동작합니다.
+
 ```powershell
 python mysh.py
 ```
 
-외부 패키지 설치는 필요 없습니다.
+Windows에서는 시작 시 콘솔 코드 페이지와 Python 표준 입출력을 UTF-8로 맞춰 한글과 이모지가 깨질 가능성을 줄입니다.
+
+### 향상된 실행(선택 의존성)
+
+Rich 테이블/패널 출력과 prompt_toolkit 입력 루프를 쓰려면 선택 의존성을 설치합니다.
+
+```powershell
+python -m pip install -r requirements.txt
+python mysh.py
+```
+
+`rich`가 있으면 `ai doctor`, `ai sessions`, `ai show`가 Rich 테이블·패널로 출력됩니다. `prompt_toolkit`이 있으면 영속 히스토리, 명령어/별칭/`ai` 하위 명령 자동완성, 멀티라인 입력을 사용합니다. 일반 Enter는 실행이고, `Esc+Enter`는 줄바꿈입니다. 둘 중 하나가 없거나 둘 다 없어도 셸은 기본 실행 경로로 자동 fallback합니다.
 
 ## 명령어
 
