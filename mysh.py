@@ -116,28 +116,32 @@ FAILURE_TRACE_KEYWORDS = (
     "exception",
     "assertionerror",
 )
-# 실수 방지용 과속방지턱이다. 정규식 블록리스트는 모든 위험 명령을 잡지 못하고
+# 실수 방지용 과속방지턱이다. 정책 파일/정규식은 모든 위험 명령을 잡지 못하고
 # 우회도 가능하므로, 보안 경계로 취급하지 않는다.
-DANGEROUS_COMMAND_PATTERNS = (
-    (
-        "rm -r/rm -rf",
-        re.compile(r"(?<![\w.-])rm(?:\.exe)?(?=[^\n;&|]*(?:\s-[A-Za-z]*r[A-Za-z]*\b|\s--recursive\b))", re.IGNORECASE),
-    ),
-    ("del", re.compile(r"(?<![\w.-])del(?:\.exe)?(?![\w.-])", re.IGNORECASE)),
-    ("Remove-Item", re.compile(r"(?<![\w-])Remove-Item(?![\w-])", re.IGNORECASE)),
-    ("git reset --hard", re.compile(r"\bgit\s+reset\b[^\n;&|]*--hard\b", re.IGNORECASE)),
-    (
-        "git clean",
-        re.compile(
-            r"\bgit\s+clean\b(?![^\n;&|]*(?:\s--(?:dry-run|interactive|help)\b|\s-[A-Za-z]*[nih][A-Za-z]*\b))",
-            re.IGNORECASE,
-        ),
-    ),
-    ("DROP TABLE/DATABASE", re.compile(r"\bdrop\s+(?:table|database)\b", re.IGNORECASE)),
-    ("mkfs", re.compile(r"(?<![\w.-])mkfs(?:\.[\w.-]+)?\b", re.IGNORECASE)),
-    ("> /dev/", re.compile(r">\s*/dev/", re.IGNORECASE)),
-    ("fork bomb", re.compile(r":\s*\(\s*\)\s*\{", re.IGNORECASE)),
-)
+POLICY_ACTIONS = {"allow", "ask", "deny"}
+DEFAULT_POLICY_RULES: List[Dict[str, str]] = [
+    {
+        "match": r"(?<![\w.-])rm(?:\.exe)?(?=[^\n;&|]*(?:\s-[A-Za-z]*r[A-Za-z]*\b|\s--recursive\b))",
+        "action": "ask",
+        "reason": "recursive rm can delete many files",
+    },
+    {"match": r"(?<![\w.-])del(?:\.exe)?(?![\w.-])", "action": "ask", "reason": "del removes files"},
+    {"match": r"(?<![\w-])Remove-Item(?![\w-])", "action": "ask", "reason": "Remove-Item removes files"},
+    {"match": r"\bgit\s+reset\b[^\n;&|]*--hard\b", "action": "ask", "reason": "git reset --hard discards work"},
+    {
+        "match": r"\bgit\s+clean\b(?![^\n;&|]*(?:\s--(?:dry-run|interactive|help)\b|\s-[A-Za-z]*[nih][A-Za-z]*\b))",
+        "action": "ask",
+        "reason": "git clean removes untracked files",
+    },
+    {"match": r"\bpip(?:3)?\s+install\b", "action": "ask", "reason": "pip install changes the Python environment"},
+    {"match": r"\bnpm\s+install\b[^\n;&|]*\s-g\b|\bnpm\s+install\b[^\n;&|]*\s--global\b", "action": "ask", "reason": "global npm install changes the machine environment"},
+    {"match": r"\b(?:curl|wget)\b[^\n;&|]*\|\s*(?:sh|bash)\b", "action": "ask", "reason": "downloaded shell script execution"},
+    {"match": r"\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b[^\n;&|]*\|\s*(?:iex|Invoke-Expression)\b", "action": "ask", "reason": "downloaded PowerShell execution"},
+    {"match": r"\bdrop\s+(?:table|database)\b", "action": "deny", "reason": "DROP TABLE/DATABASE is destructive"},
+    {"match": r"(?<![\w.-])mkfs(?:\.[\w.-]+)?\b", "action": "deny", "reason": "mkfs formats filesystems"},
+    {"match": r">\s*/dev/", "action": "deny", "reason": "writing to /dev devices can destroy data"},
+    {"match": r":\s*\(\s*\)\s*\{", "action": "deny", "reason": "fork bomb pattern"},
+]
 
 
 THEMES = {
@@ -237,6 +241,8 @@ AI_SUBCOMMAND_COMPLETIONS = (
     "ai context --mode handoff",
     "ai config",
     "ai config reset",
+    "ai policy",
+    "ai policy init",
     "ai rerun",
     "ai sessions",
     "ai sessions --tool codex",
@@ -690,6 +696,88 @@ class AiTaskStore:
         self.save_state([], None)
 
 
+class CommandPolicyStore:
+    """프로젝트 루트 아래 .mysh/policy.json을 관리한다."""
+
+    def __init__(self, project_root: Path):
+        self.project_root = Path(project_root).resolve()
+        self.store_dir = self.project_root / ".mysh"
+        self.path = self.store_dir / "policy.json"
+        self.backup_path = self.store_dir / "policy.json.bak"
+
+    def ensure_store_dir(self) -> None:
+        existed = self.store_dir.exists()
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            ensure_mysh_gitignore(self.project_root)
+
+    def load(self) -> List[Dict[str, str]]:
+        if not self.path.exists():
+            return default_policy_rules()
+
+        try:
+            with self.path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            return self.recover_corrupt_store()
+
+        raw_rules = data.get("rules") if isinstance(data, dict) else data
+        if not isinstance(raw_rules, list):
+            return [{"match": r"(?s).*", "action": "deny", "reason": "invalid policy rule"}]
+        return normalize_policy_rules(raw_rules)
+
+    def save(self, rules: List[Dict[str, str]]) -> None:
+        self.ensure_store_dir()
+        payload = {"rules": normalize_policy_rules(rules)}
+        tmp_path = self.path.with_suffix(".json.tmp")
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        tmp_path.replace(self.path)
+
+    def init_default(self) -> None:
+        self.save(default_policy_rules())
+
+    def recover_corrupt_store(self) -> List[Dict[str, str]]:
+        self.ensure_store_dir()
+        try:
+            if self.path.exists():
+                shutil.copy2(self.path, self.backup_path)
+        except OSError:
+            pass
+        return default_policy_rules()
+
+
+def default_policy_rules() -> List[Dict[str, str]]:
+    return [dict(rule) for rule in DEFAULT_POLICY_RULES]
+
+
+def normalize_policy_rules(raw_rules: List[Any]) -> List[Dict[str, str]]:
+    rules: List[Dict[str, str]] = []
+    for item in raw_rules:
+        if not isinstance(item, dict):
+            rules.append({"match": r"(?s).*", "action": "deny", "reason": "invalid policy rule"})
+            continue
+        raw_match = item.get("match")
+        raw_action = item.get("action")
+        raw_reason = item.get("reason", "")
+        if (
+            not isinstance(raw_match, str)
+            or not isinstance(raw_action, str)
+            or ("reason" in item and not isinstance(raw_reason, str))
+        ):
+            rules.append({"match": r"(?s).*", "action": "deny", "reason": "invalid policy rule"})
+            continue
+        match = raw_match.strip()
+        action = raw_action.strip().lower()
+        reason = raw_reason.strip()
+        if not match or action not in POLICY_ACTIONS:
+            rules.append({"match": r"(?s).*", "action": "deny", "reason": "invalid policy rule"})
+            continue
+        rules.append({"match": match, "action": action, "reason": reason or match})
+    return rules or default_policy_rules()
+
+
 def default_shell_config() -> Dict[str, Any]:
     return {
         "theme": "green",
@@ -796,6 +884,7 @@ class ShellContext:
     project_root: Path = field(default_factory=lambda: detect_project_root(Path.cwd()))
     session_store: AiSessionStore = field(init=False)
     task_store: AiTaskStore = field(init=False)
+    policy_store: CommandPolicyStore = field(init=False)
     config_store: ShellConfigStore = field(init=False)
     active_profile: Optional[str] = None
     default_ai_tool: str = "codex"
@@ -804,6 +893,7 @@ class ShellContext:
         self.project_root = self.project_root.resolve()
         self.session_store = AiSessionStore(self.project_root)
         self.task_store = AiTaskStore(self.project_root)
+        self.policy_store = CommandPolicyStore(self.project_root)
         self.config_store = ShellConfigStore(self.project_root)
         self.load_config()
 
@@ -932,6 +1022,7 @@ def refresh_project_context(ctx: ShellContext) -> None:
         ctx.project_root = project_root
         ctx.session_store = AiSessionStore(project_root)
         ctx.task_store = AiTaskStore(project_root)
+        ctx.policy_store = CommandPolicyStore(project_root)
         ctx.config_store = ShellConfigStore(project_root)
         ctx.load_config()
 
@@ -954,11 +1045,402 @@ def expand_alias(ctx: ShellContext, line: str) -> str:
     raise ValueError("별칭 확장이 너무 깊습니다.")
 
 
+@dataclass
+class PolicyDecision:
+    action: str
+    reason: str = ""
+    segment: str = ""
+    match: str = ""
+
+
+def split_command_segments(line: str, posix: Optional[bool] = None) -> List[str]:
+    """정책 평가용으로 명령을 세그먼트로 나눈다.
+
+    이 파서는 과속방지턱용이다. POSIX 입력은 shlex를 우선 쓰고, Windows/실패
+    fallback은 따옴표만 고려해 ;, &&, ||, | 기준으로 단순 분리한다.
+    """
+    if posix is None:
+        posix = os.name != "nt"
+
+    if posix:
+        try:
+            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            segments: List[str] = []
+            current: List[str] = []
+            for token in lexer:
+                if token and all(char in ";&|" for char in token):
+                    if current:
+                        segments.append(" ".join(current).strip())
+                        current = []
+                    continue
+                current.append(token)
+            if current:
+                segments.append(" ".join(current).strip())
+            return [segment for segment in segments if segment]
+        except ValueError:
+            pass
+
+    segments = []
+    current_chars: List[str] = []
+    quote: Optional[str] = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            current_chars.append(char)
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+
+        if char in {"'", '"'}:
+            quote = char
+            current_chars.append(char)
+            index += 1
+            continue
+
+        two_chars = line[index : index + 2]
+        if two_chars in {"&&", "||"}:
+            segment = "".join(current_chars).strip()
+            if segment:
+                segments.append(segment)
+            current_chars = []
+            index += 2
+            continue
+
+        if char in {";", "|"}:
+            segment = "".join(current_chars).strip()
+            if segment:
+                segments.append(segment)
+            current_chars = []
+            index += 1
+            continue
+
+        current_chars.append(char)
+        index += 1
+
+    segment = "".join(current_chars).strip()
+    if segment:
+        segments.append(segment)
+    return segments
+
+
+def match_policy_rule(segment: str, rules: List[Dict[str, str]]) -> PolicyDecision:
+    """세그먼트에 매칭되는 정책 중 가장 강한 결정을 적용한다."""
+    decisions: List[PolicyDecision] = []
+    for rule in rules:
+        pattern = rule.get("match", "")
+        action = rule.get("action", "allow")
+        try:
+            matched = re.search(pattern, segment, re.IGNORECASE)
+        except re.error:
+            return PolicyDecision(
+                action="deny",
+                reason=f"invalid policy regex: {pattern}",
+                segment=segment,
+                match=pattern,
+            )
+        if matched:
+            decisions.append(
+                PolicyDecision(
+                    action=action,
+                    reason=rule.get("reason", pattern),
+                    segment=segment,
+                    match=pattern,
+                )
+            )
+
+    for strongest in ("deny", "ask", "allow"):
+        for decision in decisions:
+            if decision.action == strongest:
+                return decision
+    return PolicyDecision(action="allow", segment=segment)
+
+
+WRITE_COMMAND_NAMES = {
+    "add-content",
+    "copy",
+    "copy-item",
+    "cp",
+    "del",
+    "mkdir",
+    "move",
+    "move-item",
+    "mv",
+    "new-item",
+    "out-file",
+    "remove-item",
+    "rm",
+    "set-content",
+    "tee",
+    "tee-object",
+    "touch",
+}
+DESTINATION_ONLY_WRITE_COMMANDS = {"copy", "copy-item", "cp"}
+WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+POSIX_ABSOLUTE_PATH_PATTERN = re.compile(r"^/(?!/)")
+
+
+def policy_segment_tokens(segment: str) -> List[str]:
+    try:
+        return shlex.split(segment, posix=(os.name != "nt"))
+    except ValueError:
+        return segment.split()
+
+
+def normalize_command_name(token: str) -> str:
+    name = Path(token.strip("'\"")).name.lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name
+
+
+def clean_policy_path_token(token: str) -> str:
+    return token.strip().strip("'\"")
+
+
+def is_absolute_policy_path(token: str) -> bool:
+    cleaned = clean_policy_path_token(token)
+    if "://" in cleaned:
+        return False
+    return bool(WINDOWS_ABSOLUTE_PATH_PATTERN.search(cleaned) or POSIX_ABSOLUTE_PATH_PATTERN.search(cleaned))
+
+
+def policy_path_outside_root(token: str, root: Path) -> bool:
+    cleaned = clean_policy_path_token(token)
+    if not is_absolute_policy_path(cleaned) or cleaned.startswith("/dev/"):
+        return False
+    try:
+        resolved = Path(os.path.expandvars(os.path.expanduser(cleaned))).resolve()
+    except (OSError, RuntimeError):
+        return False
+    return not path_is_under_root(resolved, root)
+
+
+def redirection_target_tokens(segment: str) -> List[str]:
+    targets: List[str] = []
+    quote: Optional[str] = None
+    index = 0
+    while index < len(segment):
+        char = segment[index]
+        if quote:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == ">":
+            index += 2 if index + 1 < len(segment) and segment[index + 1] == ">" else 1
+            while index < len(segment) and segment[index].isspace():
+                index += 1
+            if index >= len(segment):
+                return targets
+            if segment[index] in {"'", '"'}:
+                quote = segment[index]
+                index += 1
+                start = index
+                while index < len(segment) and segment[index] != quote:
+                    index += 1
+                targets.append(segment[start:index])
+                if index < len(segment) and segment[index] == quote:
+                    index += 1
+                quote = None
+                continue
+            start = index
+            while index < len(segment) and not segment[index].isspace():
+                index += 1
+            targets.append(segment[start:index])
+            continue
+        index += 1
+    return targets
+
+
+def option_values(tokens: List[str], options: set[str]) -> List[str]:
+    values: List[str] = []
+    index = 1
+    while index < len(tokens):
+        lowered = tokens[index].lower()
+        for option in options:
+            if lowered == option and index + 1 < len(tokens):
+                values.append(tokens[index + 1])
+                index += 2
+                break
+            if lowered.startswith(f"{option}="):
+                values.append(tokens[index].split("=", 1)[1])
+                index += 1
+                break
+            if lowered.startswith(f"{option}:"):
+                values.append(tokens[index].split(":", 1)[1])
+                index += 1
+                break
+        else:
+            index += 1
+    return values
+
+
+def non_option_operands(tokens: List[str]) -> List[str]:
+    operands: List[str] = []
+    skip_next = False
+    value_options = {
+        "-credential",
+        "-destination",
+        "-encoding",
+        "-filter",
+        "-filepath",
+        "-include",
+        "-inputobject",
+        "-itemtype",
+        "-literalpath",
+        "-name",
+        "-path",
+        "-stream",
+        "-type",
+        "-value",
+    }
+    for token in tokens[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        lowered = token.lower()
+        if lowered in value_options:
+            skip_next = True
+            continue
+        if token.startswith("-"):
+            continue
+        operands.append(token)
+    return operands
+
+
+def write_target_tokens(segment: str) -> List[str]:
+    targets = redirection_target_tokens(segment)
+
+    tokens = policy_segment_tokens(segment)
+    if not tokens:
+        return targets
+
+    command_name = normalize_command_name(tokens[0])
+    if command_name not in WRITE_COMMAND_NAMES:
+        return targets
+
+    if command_name in {"add-content", "set-content"}:
+        command_targets = option_values(tokens, {"-path", "-literalpath"})
+        if command_targets:
+            return [*targets, *command_targets]
+        operands = non_option_operands(tokens)
+        return [*targets, *operands[:1]]
+
+    if command_name in {"out-file", "tee", "tee-object"}:
+        command_targets = option_values(tokens, {"-filepath", "-literalpath"})
+        if command_targets:
+            return [*targets, *command_targets]
+        operands = non_option_operands(tokens)
+        if command_name in {"tee", "tee-object"}:
+            return [*targets, *operands]
+        return [*targets, *operands[:1]]
+
+    if command_name == "new-item":
+        command_targets = option_values(tokens, {"-path", "-literalpath"})
+        if command_targets:
+            return [*targets, *command_targets]
+        operands = non_option_operands(tokens)
+        return [*targets, *operands[:1]]
+
+    if command_name == "remove-item":
+        command_targets = option_values(tokens, {"-path", "-literalpath"})
+        if command_targets:
+            return [*targets, *command_targets]
+
+    if command_name in {"copy", "copy-item", "cp"}:
+        command_targets = option_values(tokens, {"-destination"})
+        if command_targets:
+            return [*targets, *command_targets]
+
+    if command_name in {"move", "move-item", "mv"}:
+        command_targets = option_values(tokens, {"-path", "-literalpath", "-destination"})
+        if command_targets:
+            return [*targets, *command_targets]
+
+    operands = non_option_operands(tokens)
+    if not operands:
+        return targets
+    if command_name in DESTINATION_ONLY_WRITE_COMMANDS:
+        return [*targets, operands[-1]]
+    return [*targets, *operands]
+
+
+def detect_outside_workspace_write(segment: str, root: Path) -> Optional[str]:
+    """프로젝트 루트 밖 절대경로 쓰기 시도를 느슨하게 감지한다."""
+    root = root.resolve()
+    for candidate in write_target_tokens(segment):
+        if policy_path_outside_root(candidate, root):
+            return "workspace outside absolute path write"
+    return None
+
+
+def evaluate_command_policy(
+    line: str,
+    rules: Optional[List[Dict[str, str]]] = None,
+    project_root: Optional[Path] = None,
+) -> PolicyDecision:
+    """외부 명령 전체에 적용될 최종 정책 결정을 계산한다."""
+    normalized_rules = normalize_policy_rules(rules) if rules is not None else default_policy_rules()
+    root = (project_root or detect_project_root(Path.cwd())).resolve()
+    decisions: List[PolicyDecision] = []
+    segments = split_command_segments(line)
+
+    # 파이프를 포함한 정책은 세그먼트 분리 후 놓칠 수 있어 전체 줄도 함께 본다.
+    for rule in normalized_rules:
+        pattern = rule.get("match", "")
+        if "|" not in pattern:
+            continue
+        try:
+            matched = re.search(pattern, line, re.IGNORECASE)
+        except re.error:
+            decisions.append(
+                PolicyDecision(
+                    action="deny",
+                    reason=f"invalid policy regex: {pattern}",
+                    segment=line.strip(),
+                    match=pattern,
+                )
+            )
+            continue
+        if matched:
+            decisions.append(
+                PolicyDecision(
+                    action=rule.get("action", "allow"),
+                    reason=rule.get("reason", pattern),
+                    segment=line.strip(),
+                    match=pattern,
+                )
+            )
+
+    for segment in segments:
+        decision = match_policy_rule(segment, normalized_rules)
+        if decision.action != "allow":
+            decisions.append(decision)
+            continue
+        outside_reason = detect_outside_workspace_write(segment, root)
+        if outside_reason:
+            decisions.append(PolicyDecision(action="ask", reason=outside_reason, segment=segment))
+
+    for action in ("deny", "ask"):
+        for decision in decisions:
+            if decision.action == action:
+                return decision
+    return PolicyDecision(action="allow")
+
+
 def detect_dangerous_command(line: str) -> Optional[str]:
-    """명백히 파괴적인 외부 명령 패턴을 찾는다."""
-    for label, pattern in DANGEROUS_COMMAND_PATTERNS:
-        if pattern.search(line):
-            return label
+    """호환용: 기본 정책에서 ask/deny가 필요한 명령 사유를 반환한다."""
+    decision = evaluate_command_policy(line, default_policy_rules())
+    if decision.action in {"ask", "deny"}:
+        return decision.reason
     return None
 
 
@@ -970,9 +1452,11 @@ def is_interactive_stdin() -> bool:
         return False
 
 
-def confirm_dangerous_command(line: str, reason: str) -> bool:
-    """위험 명령 실행 전 y/N 확인을 받는다. 기본값은 N이다."""
-    print_warning(f"위험할 수 있는 외부 명령 패턴을 감지했습니다: {reason}")
+def confirm_policy_command(line: str, decision: PolicyDecision) -> bool:
+    """정책상 확인이 필요한 명령 실행 전 y/N 확인을 받는다. 기본값은 N이다."""
+    print_warning(f"정책상 확인이 필요한 외부 명령입니다: {decision.reason}")
+    if decision.segment:
+        print(f"segment: {decision.segment}")
     print(line)
     try:
         answer = input("계속 실행할까요? [y/N] ")
@@ -982,19 +1466,28 @@ def confirm_dangerous_command(line: str, reason: str) -> bool:
 
 
 def should_run_external_command(line: str, bypass_safety: bool = False) -> bool:
-    """OS 셸로 넘기기 전 위험 명령 과속방지턱을 적용한다."""
+    """OS 셸로 넘기기 전 정책 기반 과속방지턱을 적용한다."""
+    project_root = detect_project_root(Path.cwd())
+    policy_store = CommandPolicyStore(project_root)
+    decision = evaluate_command_policy(line, policy_store.load(), project_root)
+    if decision.action == "allow":
+        return True
+
+    if decision.action == "deny":
+        print_warning(f"정책상 차단된 외부 명령입니다: {decision.reason}")
+        if decision.segment:
+            print(f"segment: {decision.segment}")
+        print("실행하려면 .mysh/policy.json 정책을 수정하세요.")
+        return False
+
     if bypass_safety:
         return True
 
-    reason = detect_dangerous_command(line)
-    if not reason:
-        return True
-
     if not is_interactive_stdin():
-        print_warning(f"비대화형 입력에서는 확인할 수 없어 위험 명령을 차단했습니다: {reason}")
+        print_warning(f"비대화형 입력에서는 확인할 수 없어 정책 확인 명령을 차단했습니다: {decision.reason}")
         return False
 
-    if confirm_dangerous_command(line, reason):
+    if confirm_policy_command(line, decision):
         return True
 
     print_warning("외부 명령을 실행하지 않았습니다.")
@@ -2373,6 +2866,49 @@ def print_ai_task_detail(task: AiTask) -> None:
     print(f"next_action: {task.next_action or '-'}")
 
 
+def print_ai_policy(ctx: ShellContext) -> None:
+    refresh_project_context(ctx)
+    rules = ctx.policy_store.load()
+    source = str(ctx.policy_store.path) if ctx.policy_store.path.exists() else "built-in default"
+    print("AI Policy")
+    print(f"source: {source}")
+    for index, rule in enumerate(rules, start=1):
+        print(f"{index}. {rule['action'].upper()} {rule['match']}")
+        print(f"   reason: {rule['reason']}")
+
+
+def handle_ai_policy_command(ctx: ShellContext, args: List[str]) -> None:
+    refresh_project_context(ctx)
+    usage = "사용법: ai policy | ai policy init"
+    if not args:
+        print_ai_policy(ctx)
+        return
+
+    action = args[0].lower()
+    if action == "init":
+        if len(args) > 1:
+            print_error(f"알 수 없는 ai policy init 옵션입니다: {' '.join(args[1:])}")
+            print(usage)
+            return
+        if ctx.policy_store.path.exists():
+            if not is_interactive_stdin():
+                print_warning("비대화형 입력에서는 기존 policy.json 덮어쓰기를 확인할 수 없어 중단했습니다.")
+                return
+            try:
+                answer = input(f"{ctx.policy_store.path}를 기본 정책으로 덮어쓸까요? [y/N] ")
+            except EOFError:
+                answer = ""
+            if answer.strip().lower() not in {"y", "yes"}:
+                print("policy init을 취소했습니다.")
+                return
+        ctx.policy_store.init_default()
+        print(f"기본 정책을 기록했습니다: {ctx.policy_store.path}")
+        return
+
+    print_error(f"알 수 없는 ai policy 명령입니다: {action}")
+    print(usage)
+
+
 def parse_task_done_options(args: List[str]) -> tuple[str, Optional[str]]:
     if not args:
         raise ValueError("종료할 task id를 입력하세요.")
@@ -2609,11 +3145,11 @@ def cmd_help(ctx: ShellContext, args: List[str], raw_args: str) -> None:
             print(f"  {name} -> {ctx.aliases[name]}")
 
     print("\n안전장치:")
-    print("  미등록 외부 명령이 명백히 위험한 패턴이면 y/N 확인 후 실행합니다.")
-    print("  !<명령>은 내장/별칭과 이 확인을 의도적으로 우회합니다.")
+    print("  미등록 외부 명령은 .mysh/policy.json 정책으로 allow/ask/deny 평가를 받습니다.")
+    print("  !<명령>은 ask 확인만 우회하며, deny 정책은 정책 파일 수정 없이는 차단됩니다.")
 
 
-@command("ai", "AI 작업 보조 명령입니다. 예: ai doctor, ai task, ai sessions, ai start codex")
+@command("ai", "AI 작업 보조 명령입니다. 예: ai doctor, ai policy, ai task, ai sessions, ai start codex")
 def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
     try:
         parsed_args = parse_process_args(raw_args)
@@ -2622,7 +3158,7 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     if not parsed_args:
-        print("사용법: ai doctor | ai context | ai task | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
+        print("사용법: ai doctor | ai context | ai policy | ai task | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
         return
 
     subcommand = parsed_args[0].lower()
@@ -2650,6 +3186,10 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
 
     if subcommand == "task":
         handle_ai_task_command(ctx, parsed_args[1:])
+        return
+
+    if subcommand == "policy":
+        handle_ai_policy_command(ctx, parsed_args[1:])
         return
 
     if subcommand == "config":
@@ -2733,7 +3273,7 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     print_error(f"알 수 없는 ai 하위 명령입니다: {subcommand}")
-    print("사용법: ai doctor | ai context | ai task | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
+    print("사용법: ai doctor | ai context | ai policy | ai task | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
 
 
 @command("codex", "Codex CLI를 세션으로 기록한 뒤 실행합니다.")
