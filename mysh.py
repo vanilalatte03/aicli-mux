@@ -96,6 +96,7 @@ TEXT_PREVIEW_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+GIT_EMPTY_TREE_SHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 AI_CONTEXT_MODES = ("default", "debug", "review", "handoff")
 AI_CONTEXT_DEFAULT_MAX_LINES = {
     "default": 200,
@@ -245,6 +246,13 @@ AI_SUBCOMMAND_COMPLETIONS = (
     "ai start",
     "ai start codex",
     "ai start claude",
+    "ai task",
+    "ai task current",
+    "ai task done",
+    "ai task list",
+    "ai task new",
+    "ai task show",
+    "ai task use",
 )
 
 
@@ -488,6 +496,200 @@ class AiSessionStore:
         self.save([])
 
 
+@dataclass
+class AiTask:
+    id: str
+    goal: str
+    cwd: str
+    status: str
+    created_at: str
+    updated_at: str
+    session_ids: List[str] = field(default_factory=list)
+    git_baseline: Optional[Dict[str, Any]] = None
+    changed_files: Optional[List[str]] = None
+    test_result: Optional[str] = None
+    next_action: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "id": self.id,
+            "goal": self.goal,
+            "cwd": self.cwd,
+            "status": self.status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "session_ids": list(self.session_ids),
+        }
+        if self.git_baseline is not None:
+            data["git_baseline"] = self.git_baseline
+        if self.changed_files is not None:
+            data["changed_files"] = list(self.changed_files)
+        if self.test_result:
+            data["test_result"] = self.test_result
+        if self.next_action:
+            data["next_action"] = self.next_action
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AiTask":
+        raw_status = str(data.get("status", "active"))
+        status = raw_status if raw_status in {"active", "done"} else "active"
+        raw_session_ids = data.get("session_ids", [])
+        session_ids = [str(item) for item in raw_session_ids] if isinstance(raw_session_ids, list) else []
+
+        raw_baseline = data.get("git_baseline")
+        git_baseline = raw_baseline if isinstance(raw_baseline, dict) else None
+
+        raw_changed_files = data.get("changed_files")
+        changed_files = [str(item) for item in raw_changed_files] if isinstance(raw_changed_files, list) else None
+
+        test_result = data.get("test_result")
+        next_action = data.get("next_action")
+        return cls(
+            id=str(data.get("id", "")),
+            goal=str(data.get("goal", "")),
+            cwd=str(data.get("cwd", "")),
+            status=status,
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+            session_ids=session_ids,
+            git_baseline=git_baseline,
+            changed_files=changed_files,
+            test_result=str(test_result) if test_result else None,
+            next_action=str(next_action) if next_action else None,
+        )
+
+
+class AiTaskStore:
+    """프로젝트 루트 아래 .mysh/tasks.json을 관리한다."""
+
+    def __init__(self, project_root: Path):
+        self.project_root = Path(project_root).resolve()
+        self.store_dir = self.project_root / ".mysh"
+        self.path = self.store_dir / "tasks.json"
+        self.backup_path = self.store_dir / "tasks.json.bak"
+
+    def ensure_store_dir(self) -> None:
+        existed = self.store_dir.exists()
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            ensure_mysh_gitignore(self.project_root)
+
+    def load_state(self) -> tuple[List[AiTask], Optional[str]]:
+        if not self.path.exists():
+            return [], None
+
+        try:
+            with self.path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            self.recover_corrupt_store()
+            return [], None
+
+        current_task_id: Optional[str] = None
+        if isinstance(data, dict):
+            raw_tasks = data.get("tasks", [])
+            raw_current = data.get("current_task_id")
+            if isinstance(raw_current, str) and raw_current:
+                current_task_id = raw_current
+        else:
+            raw_tasks = data
+
+        if not isinstance(raw_tasks, list):
+            self.recover_corrupt_store()
+            return [], None
+
+        tasks: List[AiTask] = []
+        for item in raw_tasks:
+            if not isinstance(item, dict):
+                continue
+            task = AiTask.from_dict(item)
+            if task.id:
+                tasks.append(task)
+        return tasks, current_task_id
+
+    def load(self) -> List[AiTask]:
+        tasks, _current_task_id = self.load_state()
+        return tasks
+
+    def save_state(self, tasks: List[AiTask], current_task_id: Optional[str]) -> None:
+        self.ensure_store_dir()
+        payload: Dict[str, Any] = {"tasks": [task.to_dict() for task in tasks]}
+        if current_task_id:
+            payload["current_task_id"] = current_task_id
+        tmp_path = self.path.with_suffix(".json.tmp")
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        tmp_path.replace(self.path)
+
+    def add(self, task: AiTask, set_current: bool = True) -> None:
+        tasks, current_task_id = self.load_state()
+        tasks.append(task)
+        self.save_state(tasks, task.id if set_current else current_task_id)
+
+    def update(self, task: AiTask, current_task_id: Optional[str]) -> None:
+        tasks, _previous_current = self.load_state()
+        for index, current in enumerate(tasks):
+            if current.id == task.id:
+                tasks[index] = task
+                self.save_state(tasks, current_task_id)
+                return
+        tasks.append(task)
+        self.save_state(tasks, current_task_id)
+
+    def get(self, task_id: str) -> Optional[AiTask]:
+        tasks = self.load()
+        for task in tasks:
+            if task.id == task_id:
+                return task
+
+        matches = [task for task in tasks if task.id.startswith(task_id)]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def current(self) -> Optional[AiTask]:
+        tasks, current_task_id = self.load_state()
+        if not current_task_id:
+            return None
+        for task in tasks:
+            if task.id == current_task_id and task.status == "active":
+                return task
+        return None
+
+    def set_current(self, task_id: str) -> Optional[AiTask]:
+        tasks, _current_task_id = self.load_state()
+        matches = [task for task in tasks if task.id == task_id or task.id.startswith(task_id)]
+        if len(matches) != 1 or matches[0].status != "active":
+            return None
+        self.save_state(tasks, matches[0].id)
+        return matches[0]
+
+    def add_session_to_current(self, session_id: str) -> Optional[AiTask]:
+        tasks, current_task_id = self.load_state()
+        if not current_task_id:
+            return None
+        for index, task in enumerate(tasks):
+            if task.id == current_task_id and task.status == "active":
+                if session_id not in task.session_ids:
+                    task.session_ids.append(session_id)
+                    task.updated_at = now_iso()
+                    tasks[index] = task
+                    self.save_state(tasks, current_task_id)
+                return task
+        return None
+
+    def recover_corrupt_store(self) -> None:
+        self.ensure_store_dir()
+        try:
+            if self.path.exists():
+                shutil.copy2(self.path, self.backup_path)
+        except OSError:
+            pass
+        self.save_state([], None)
+
+
 def default_shell_config() -> Dict[str, Any]:
     return {
         "theme": "green",
@@ -593,6 +795,7 @@ class ShellContext:
     input_backend: str = "input"
     project_root: Path = field(default_factory=lambda: detect_project_root(Path.cwd()))
     session_store: AiSessionStore = field(init=False)
+    task_store: AiTaskStore = field(init=False)
     config_store: ShellConfigStore = field(init=False)
     active_profile: Optional[str] = None
     default_ai_tool: str = "codex"
@@ -600,6 +803,7 @@ class ShellContext:
     def __post_init__(self) -> None:
         self.project_root = self.project_root.resolve()
         self.session_store = AiSessionStore(self.project_root)
+        self.task_store = AiTaskStore(self.project_root)
         self.config_store = ShellConfigStore(self.project_root)
         self.load_config()
 
@@ -727,6 +931,7 @@ def refresh_project_context(ctx: ShellContext) -> None:
     if project_root != ctx.project_root:
         ctx.project_root = project_root
         ctx.session_store = AiSessionStore(project_root)
+        ctx.task_store = AiTaskStore(project_root)
         ctx.config_store = ShellConfigStore(project_root)
         ctx.load_config()
 
@@ -1062,6 +1267,99 @@ def changed_git_files(root: Optional[Path] = None) -> List[str]:
     if not status or status.returncode != 0:
         return []
     return [line for line in status.stdout.splitlines() if line.strip()]
+
+
+def current_git_head(root: Optional[Path] = None) -> Optional[str]:
+    result = git_result(["rev-parse", "HEAD"], cwd=root)
+    if not result or result.returncode != 0:
+        return None
+    head = result.stdout.strip()
+    return head or None
+
+
+def git_baseline_snapshot(root: Path) -> Optional[Dict[str, Any]]:
+    """작업 시작 시점의 Git HEAD와 status를 저장한다. Git이 아니면 None."""
+    if not is_git_repository(root):
+        return None
+    return {
+        "head": current_git_head(root),
+        "branch": current_git_branch(root),
+        "status": changed_git_files(root),
+    }
+
+
+def porcelain_status_paths(line: str) -> List[str]:
+    if len(line) < 4:
+        return []
+    path_text = line[3:].strip()
+    if not path_text:
+        return []
+    if " -> " in path_text:
+        return [part.strip() for part in path_text.split(" -> ") if part.strip()]
+    return [path_text]
+
+
+def name_status_paths(line: str) -> List[str]:
+    parts = [part.strip() for part in line.split("\t") if part.strip()]
+    return parts[1:] if len(parts) > 1 else []
+
+
+def baseline_tracked_dirty_paths(baseline: Optional[Dict[str, Any]]) -> set[str]:
+    if not isinstance(baseline, dict):
+        return set()
+    raw_status = baseline.get("status", [])
+    if not isinstance(raw_status, list):
+        return set()
+
+    paths = set()
+    for item in raw_status:
+        line = str(item)
+        if line.startswith(("??", "!!")):
+            continue
+        paths.update(porcelain_status_paths(line))
+    return paths
+
+
+def changed_git_files_since_baseline(root: Path, baseline: Optional[Dict[str, Any]]) -> Optional[List[str]]:
+    """baseline 이후 변경 요약을 산출한다. Git이 아니면 None."""
+    if not is_git_repository(root):
+        return None
+
+    current_status = changed_git_files(root)
+    baseline_status = baseline.get("status", []) if isinstance(baseline, dict) else []
+    baseline_status_set = set(str(line) for line in baseline_status if str(line).strip())
+    baseline_dirty_paths = baseline_tracked_dirty_paths(baseline)
+    status_delta = [
+        line
+        for line in current_status
+        if line not in baseline_status_set and not baseline_dirty_paths.intersection(porcelain_status_paths(line))
+    ]
+
+    diff_lines: List[str] = []
+    head = baseline.get("head") if isinstance(baseline, dict) else None
+    if isinstance(head, str) and head:
+        raw_diff_lines = git_stdout_lines(root, ["diff", "--name-status", head, "--"], timeout=10.0)
+        diff_lines = [
+            line
+            for line in raw_diff_lines
+            if not baseline_dirty_paths.intersection(name_status_paths(line))
+        ]
+    elif current_git_head(root):
+        raw_diff_lines = git_stdout_lines(root, ["diff", "--name-status", GIT_EMPTY_TREE_SHA1, "HEAD", "--"], timeout=10.0)
+        diff_lines = [
+            line
+            for line in raw_diff_lines
+            if not baseline_dirty_paths.intersection(name_status_paths(line))
+        ]
+
+    combined: List[str] = []
+    seen = set()
+    for line in [*diff_lines, *status_delta]:
+        if not line.strip() or line in seen:
+            continue
+        combined.append(line)
+        seen.add(line)
+    return combined
 
 
 def recent_git_commits(limit: int = 3, root: Optional[Path] = None) -> List[str]:
@@ -1890,6 +2188,7 @@ def run_ai_tool_session(
     command_args = build_ai_command(tool, user_args, cwd)
     session = create_ai_session(tool, cwd, command_args, title, session_profile, user_args=user_args)
     ctx.session_store.add(session)
+    ctx.task_store.add_session_to_current(session.id)
     process_args = [resolve_executable_for_subprocess(command_args[0]), *command_args[1:]]
 
     exit_code: Optional[int] = None
@@ -1981,6 +2280,205 @@ def print_ai_sessions(sessions: List[AiSession]) -> None:
 
     for line in format_text_table(["id", "tool", "title", "cwd", "updated_at", "exit"], rows):
         print(line)
+
+
+def create_ai_task(cwd: Path, goal: str) -> AiTask:
+    timestamp = now_iso()
+    return AiTask(
+        id=uuid.uuid4().hex[:12],
+        goal=goal,
+        cwd=str(cwd.resolve()),
+        status="active",
+        created_at=timestamp,
+        updated_at=timestamp,
+        session_ids=[],
+        git_baseline=git_baseline_snapshot(cwd),
+        changed_files=None,
+    )
+
+
+def task_changed_files_for_display(task: AiTask) -> Optional[List[str]]:
+    if task.status == "done":
+        return task.changed_files
+    return changed_git_files_since_baseline(Path(task.cwd), task.git_baseline)
+
+
+def print_ai_tasks(tasks: List[AiTask], current_task_id: Optional[str]) -> None:
+    if not tasks:
+        print("(저장된 작업 없음)")
+        return
+
+    console = rich_console()
+    if console is not None and RichTable is not None:
+        table = RichTable(title="AI Tasks", show_header=True, header_style="bold")
+        table.add_column("id", no_wrap=True)
+        table.add_column("status", no_wrap=True)
+        table.add_column("sessions", justify="right")
+        table.add_column("updated_at", no_wrap=True)
+        table.add_column("goal")
+        for task in sorted(tasks, key=lambda item: item.updated_at, reverse=True):
+            marker = "*" if task.id == current_task_id else ""
+            table.add_row(
+                rich_escape(f"{marker}{task.id}"),
+                rich_escape(task.status),
+                rich_escape(len(task.session_ids)),
+                rich_escape(task.updated_at),
+                rich_escape(shorten(task.goal, 60)),
+            )
+        console.print(table)
+        return
+
+    rows = []
+    for task in sorted(tasks, key=lambda item: item.updated_at, reverse=True):
+        rows.append(
+            [
+                f"{'*' if task.id == current_task_id else ''}{task.id}",
+                task.status,
+                str(len(task.session_ids)),
+                task.updated_at,
+                shorten(task.goal, 60),
+            ]
+        )
+
+    for line in format_text_table(["id", "status", "sessions", "updated_at", "goal"], rows):
+        print(line)
+
+
+def print_ai_task_detail(task: AiTask) -> None:
+    changed_files = task_changed_files_for_display(task)
+    baseline = task.git_baseline or {}
+    print(f"id: {task.id}")
+    print(f"goal: {task.goal}")
+    print(f"cwd: {task.cwd}")
+    print(f"status: {task.status}")
+    print(f"created_at: {task.created_at}")
+    print(f"updated_at: {task.updated_at}")
+    print(f"sessions: {', '.join(task.session_ids) if task.session_ids else '-'}")
+    if task.git_baseline is not None:
+        print(f"git_baseline.head: {baseline.get('head') or '-'}")
+        print(f"git_baseline.branch: {baseline.get('branch') or '-'}")
+        baseline_status = baseline.get("status", [])
+        print("git_baseline.status:")
+        for line in baseline_status or ["(clean)"]:
+            print(f"  {line}")
+    else:
+        print("git_baseline: -")
+    print("changed_files:")
+    if changed_files is None:
+        print("  -")
+    else:
+        for line in changed_files or ["(없음)"]:
+            print(f"  {line}")
+    print(f"test_result: {task.test_result or '-'}")
+    print(f"next_action: {task.next_action or '-'}")
+
+
+def parse_task_done_options(args: List[str]) -> tuple[str, Optional[str]]:
+    if not args:
+        raise ValueError("종료할 task id를 입력하세요.")
+    task_id = args[0]
+    next_action: Optional[str] = None
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        if arg == "--next":
+            if index + 1 >= len(args):
+                raise ValueError("--next에는 값이 필요합니다.")
+            next_action = args[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--next="):
+            next_action = arg.split("=", 1)[1]
+            index += 1
+            continue
+        raise ValueError(f"알 수 없는 ai task done 옵션입니다: {arg}")
+    return task_id, next_action
+
+
+def handle_ai_task_command(ctx: ShellContext, args: List[str]) -> None:
+    refresh_project_context(ctx)
+    usage = (
+        "사용법: ai task new <goal> | ai task list | ai task show <id> | "
+        "ai task done <id> [--next N] | ai task current | ai task use <id>"
+    )
+    if not args:
+        print(usage)
+        return
+
+    action = args[0].lower()
+    if action == "new":
+        goal = " ".join(args[1:]).strip()
+        if not goal:
+            print_error("task goal을 입력하세요.")
+            print("사용법: ai task new <goal>")
+            return
+        task = create_ai_task(Path.cwd(), goal)
+        ctx.task_store.add(task, set_current=True)
+        print(f"active task를 만들었습니다: {task.id}")
+        return
+
+    if action == "list":
+        tasks, current_task_id = ctx.task_store.load_state()
+        print_ai_tasks(tasks, current_task_id)
+        return
+
+    if action == "show":
+        if len(args) < 2:
+            print_error("task id를 입력하세요.")
+            print("사용법: ai task show <id>")
+            return
+        task = ctx.task_store.get(args[1])
+        if not task:
+            print_error(f"task를 찾을 수 없습니다: {args[1]}")
+            return
+        print_ai_task_detail(task)
+        return
+
+    if action == "current":
+        task = ctx.task_store.current()
+        if not task:
+            print("(현재 active task 없음)")
+            return
+        print_ai_task_detail(task)
+        return
+
+    if action == "use":
+        if len(args) < 2:
+            print_error("전환할 task id를 입력하세요.")
+            print("사용법: ai task use <id>")
+            return
+        task = ctx.task_store.set_current(args[1])
+        if not task:
+            print_error(f"active task를 찾을 수 없습니다: {args[1]}")
+            return
+        print(f"current task: {task.id} {task.goal}")
+        return
+
+    if action == "done":
+        try:
+            task_id, next_action = parse_task_done_options(args[1:])
+        except ValueError as exc:
+            print_error(str(exc))
+            print("사용법: ai task done <id> [--next N]")
+            return
+        tasks, current_task_id = ctx.task_store.load_state()
+        matches = [task for task in tasks if task.id == task_id or task.id.startswith(task_id)]
+        if len(matches) != 1:
+            print_error(f"task를 찾을 수 없습니다: {task_id}")
+            return
+        task = matches[0]
+        task.status = "done"
+        task.updated_at = now_iso()
+        task.changed_files = changed_git_files_since_baseline(Path(task.cwd), task.git_baseline)
+        if next_action:
+            task.next_action = next_action
+        next_current_task_id = None if current_task_id == task.id else current_task_id
+        ctx.task_store.update(task, next_current_task_id)
+        print(f"task를 완료했습니다: {task.id}")
+        return
+
+    print_error(f"알 수 없는 ai task 명령입니다: {action}")
+    print(usage)
 
 
 def filter_ai_sessions(
@@ -2115,7 +2613,7 @@ def cmd_help(ctx: ShellContext, args: List[str], raw_args: str) -> None:
     print("  !<명령>은 내장/별칭과 이 확인을 의도적으로 우회합니다.")
 
 
-@command("ai", "AI 작업 보조 명령입니다. 예: ai doctor, ai sessions, ai start codex")
+@command("ai", "AI 작업 보조 명령입니다. 예: ai doctor, ai task, ai sessions, ai start codex")
 def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
     try:
         parsed_args = parse_process_args(raw_args)
@@ -2124,7 +2622,7 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     if not parsed_args:
-        print("사용법: ai doctor | ai context | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
+        print("사용법: ai doctor | ai context | ai task | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
         return
 
     subcommand = parsed_args[0].lower()
@@ -2148,6 +2646,10 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
             print("사용법: ai context [--mode debug|review|handoff] [--max-lines N]")
             return
         print_ai_context(ctx, mode=mode, max_lines=max_lines)
+        return
+
+    if subcommand == "task":
+        handle_ai_task_command(ctx, parsed_args[1:])
         return
 
     if subcommand == "config":
@@ -2231,7 +2733,7 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     print_error(f"알 수 없는 ai 하위 명령입니다: {subcommand}")
-    print("사용법: ai doctor | ai context | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
+    print("사용법: ai doctor | ai context | ai task | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
 
 
 @command("codex", "Codex CLI를 세션으로 기록한 뒤 실행합니다.")
