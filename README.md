@@ -46,13 +46,14 @@ python mysh.py
 |------|------|
 | `ai doctor` | Python·Git·Codex·Claude 환경 점검 |
 | `ai context [--mode debug\|review\|handoff] [--max-lines N]` | 기본/디버그/리뷰/인수인계용 plain-text 컨텍스트 팩 출력 |
-| `ai sessions` | 저장된 AI 세션 목록 |
-| `ai show <id>` | 세션 상세 (tool, cwd, command, 시각, exit code) |
+| `ai sessions [--tool codex\|claude] [--failed]` | 저장된 AI 세션 목록, 도구별/실패 세션 필터 |
+| `ai show <id> [--json]` | 세션 상세 또는 스크립트용 JSON 메타데이터 |
+| `ai rerun <id>` | 저장된 세션의 tool/cwd/플래그로 새 세션 재실행 |
 | `ai start codex [--title T] [--profile P] [prompt...]` | 세션 기록 후 Codex 실행 |
 | `ai start claude [--title T] [--profile P] [prompt...]` | 세션 기록 후 Claude 실행 |
 | `codex ...` / `claude ...` | 세션을 먼저 기록한 뒤 실제 CLI에 위임 |
 
-등록되지 않은 명령은 OS 셸 명령으로 실행을 시도합니다. AI 세션은 프로젝트 루트의 `.mysh/sessions.json`에 저장되며, **프롬프트 본문은 저장하지 않고** 유무·길이만 기록합니다.
+등록되지 않은 명령은 OS 셸 명령으로 실행을 시도합니다. AI 세션은 프로젝트 루트의 `.mysh/sessions.json`에 저장되며, **프롬프트 본문은 저장하지 않고** 유무·길이만 기록합니다. `ai rerun`은 대화를 이어가지 않고 저장된 실행 옵션으로 새 세션을 시작합니다.
 
 ## 새 명령어 추가
 

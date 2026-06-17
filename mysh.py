@@ -203,8 +203,12 @@ AI_SUBCOMMAND_COMPLETIONS = (
     "ai context --mode debug",
     "ai context --mode review",
     "ai context --mode handoff",
+    "ai rerun",
     "ai sessions",
+    "ai sessions --tool codex",
+    "ai sessions --failed",
     "ai show",
+    "ai show --json",
     "ai start",
     "ai start codex",
     "ai start claude",
@@ -325,6 +329,7 @@ class AiSession:
     created_at: str
     updated_at: str
     exit_code: Optional[int]
+    args: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -333,6 +338,7 @@ class AiSession:
             "tool": self.tool,
             "cwd": self.cwd,
             "command": self.command,
+            "args": list(self.args),
             "profile": self.profile,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -344,6 +350,8 @@ class AiSession:
         exit_code = data.get("exit_code")
         if not isinstance(exit_code, int):
             exit_code = None
+        raw_args = data.get("args", [])
+        args = [str(item) for item in raw_args] if isinstance(raw_args, list) else []
         return cls(
             id=str(data.get("id", "")),
             title=str(data.get("title", "")),
@@ -354,6 +362,7 @@ class AiSession:
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
             exit_code=exit_code,
+            args=args,
         )
 
 
@@ -1346,6 +1355,11 @@ LONG_FLAGS_WITH_VALUE = {
 }
 CODEX_SHORT_FLAGS_WITH_VALUE = {"-C", "-a", "-c", "-i", "-m", "-p", "-s"}
 CLAUDE_SHORT_FLAGS_WITH_VALUE = {"-d", "-m", "-n", "-r", "-w"}
+AI_RERUN_EXCLUDED_FLAGS = {
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust",
+    "--dangerously-skip-permissions",
+}
 
 
 def has_codex_cd_arg(args: List[str]) -> bool:
@@ -1442,6 +1456,48 @@ def short_flags_with_value(tool: str) -> set[str]:
     return set()
 
 
+def extract_rerunnable_ai_args(tool: str, args: List[str]) -> List[str]:
+    """프롬프트 본문 없이 재실행 가능한 옵션/플래그만 보존한다."""
+    rerunnable: List[str] = []
+    value_short_flags = short_flags_with_value(tool)
+    index = 0
+
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+
+        if arg.startswith("--") and arg != "--":
+            name, separator, _value = arg.partition("=")
+            if name in AI_RERUN_EXCLUDED_FLAGS:
+                index += 1
+                continue
+            if separator:
+                rerunnable.append(arg)
+                index += 1
+                continue
+            if name in LONG_FLAGS_WITH_VALUE and index + 1 < len(args):
+                rerunnable.extend([arg, args[index + 1]])
+                index += 2
+                continue
+            rerunnable.append(arg)
+            index += 1
+            continue
+
+        if arg.startswith("-") and arg != "-":
+            if arg in value_short_flags and index + 1 < len(args):
+                rerunnable.extend([arg, args[index + 1]])
+                index += 2
+                continue
+            rerunnable.append(arg)
+            index += 1
+            continue
+
+        break
+
+    return rerunnable
+
+
 def summarize_ai_command(tool: str, args: List[str]) -> str:
     """프롬프트 본문을 제외한 안전한 명령 요약을 만든다."""
     parts = [tool]
@@ -1490,7 +1546,14 @@ def default_session_title(tool: str) -> str:
     return f"{tool} session"
 
 
-def create_ai_session(tool: str, cwd: Path, command_args: List[str], title: Optional[str], profile: Optional[str]) -> AiSession:
+def create_ai_session(
+    tool: str,
+    cwd: Path,
+    command_args: List[str],
+    title: Optional[str],
+    profile: Optional[str],
+    user_args: Optional[List[str]] = None,
+) -> AiSession:
     timestamp = now_iso()
     return AiSession(
         id=uuid.uuid4().hex[:12],
@@ -1502,6 +1565,7 @@ def create_ai_session(tool: str, cwd: Path, command_args: List[str], title: Opti
         created_at=timestamp,
         updated_at=timestamp,
         exit_code=None,
+        args=extract_rerunnable_ai_args(tool, user_args if user_args is not None else command_args[1:]),
     )
 
 
@@ -1552,16 +1616,17 @@ def run_ai_tool_session(
     user_args: List[str],
     title: Optional[str] = None,
     profile: Optional[str] = None,
+    cwd_override: Optional[Path] = None,
 ) -> int:
     """세션을 기록하고 TTY를 상속한 채 실제 Codex/Claude CLI를 실행한다."""
     refresh_project_context(ctx)
-    cwd = Path.cwd().resolve()
+    cwd = (cwd_override or Path.cwd()).resolve()
     session_profile = profile or extract_long_option_value(user_args, "--profile") or ctx.active_profile
     if profile:
         ctx.active_profile = profile
 
     command_args = build_ai_command(tool, user_args, cwd)
-    session = create_ai_session(tool, cwd, command_args, title, session_profile)
+    session = create_ai_session(tool, cwd, command_args, title, session_profile, user_args=user_args)
     ctx.session_store.add(session)
     process_args = [resolve_executable_for_subprocess(command_args[0]), *command_args[1:]]
 
@@ -1656,6 +1721,50 @@ def print_ai_sessions(sessions: List[AiSession]) -> None:
         print(line)
 
 
+def filter_ai_sessions(
+    sessions: List[AiSession],
+    tool: Optional[str] = None,
+    failed_only: bool = False,
+) -> List[AiSession]:
+    filtered = sessions
+    if tool is not None:
+        filtered = [session for session in filtered if session.tool == tool]
+    if failed_only:
+        filtered = [session for session in filtered if session.exit_code not in (None, 0)]
+    return filtered
+
+
+def parse_ai_sessions_options(args: List[str]) -> tuple[Optional[str], bool]:
+    tool: Optional[str] = None
+    failed_only = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--failed":
+            failed_only = True
+            index += 1
+            continue
+        if arg == "--tool":
+            if index + 1 >= len(args):
+                raise ValueError("--tool에는 값이 필요합니다.")
+            tool = args[index + 1].lower()
+            index += 2
+            continue
+        if arg.startswith("--tool="):
+            tool = arg.split("=", 1)[1].lower()
+            index += 1
+            continue
+        raise ValueError(f"알 수 없는 ai sessions 옵션입니다: {arg}")
+
+    if tool is not None and tool not in {"codex", "claude"}:
+        raise ValueError(f"지원하지 않는 AI 도구입니다: {tool}. 사용 가능: codex, claude")
+    return tool, failed_only
+
+
+def print_ai_session_json(session: AiSession) -> None:
+    print(json.dumps(session.to_dict(), ensure_ascii=False, indent=2))
+
+
 def print_ai_session_detail(session: AiSession) -> None:
     console = rich_console()
     if console is not None and RichPanel is not None:
@@ -1665,6 +1774,7 @@ def print_ai_session_detail(session: AiSession) -> None:
             f"[bold]tool[/bold]: {rich_escape(session.tool)}",
             f"[bold]cwd[/bold]: {rich_escape(session.cwd)}",
             f"[bold]command[/bold]: {rich_escape(session.command)}",
+            f"[bold]args[/bold]: {rich_escape(' '.join(session.args) if session.args else '-')}",
             f"[bold]profile[/bold]: {rich_escape(session.profile or '-')}",
             f"[bold]created_at[/bold]: {rich_escape(session.created_at)}",
             f"[bold]updated_at[/bold]: {rich_escape(session.updated_at)}",
@@ -1678,10 +1788,31 @@ def print_ai_session_detail(session: AiSession) -> None:
     print(f"tool: {session.tool}")
     print(f"cwd: {session.cwd}")
     print(f"command: {session.command}")
+    print(f"args: {' '.join(session.args) if session.args else '-'}")
     print(f"profile: {session.profile or '-'}")
     print(f"created_at: {session.created_at}")
     print(f"updated_at: {session.updated_at}")
     print(f"exit_code: {'-' if session.exit_code is None else session.exit_code}")
+
+
+def rerun_ai_session(ctx: ShellContext, session_id: str) -> int:
+    refresh_project_context(ctx)
+    session = ctx.session_store.get(session_id)
+    if not session:
+        print_error(f"세션을 찾을 수 없습니다: {session_id}")
+        return 1
+    if session.tool not in {"codex", "claude"}:
+        print_error(f"재실행을 지원하지 않는 AI 도구입니다: {session.tool}")
+        return 1
+
+    cwd = Path(session.cwd)
+    if not cwd.exists() or not cwd.is_dir():
+        print_error(f"세션 cwd를 찾을 수 없습니다: {session.cwd}")
+        return 1
+
+    args = extract_rerunnable_ai_args(session.tool, session.args)
+    title = f"rerun: {session.title}"
+    return run_ai_tool_session(ctx, session.tool, args, title=title, profile=session.profile, cwd_override=cwd)
 
 
 # -----------------------------------------------------------------------------
@@ -1712,7 +1843,7 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     if not parsed_args:
-        print("사용법: ai doctor | ai context | ai sessions | ai show <session-id> | ai start <codex|claude> [옵션] [prompt...]")
+        print("사용법: ai doctor | ai context | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
         return
 
     subcommand = parsed_args[0].lower()
@@ -1740,20 +1871,49 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
 
     if subcommand == "sessions":
         refresh_project_context(ctx)
-        print_ai_sessions(ctx.session_store.load())
+        try:
+            tool, failed_only = parse_ai_sessions_options(parsed_args[1:])
+        except ValueError as exc:
+            print_error(str(exc))
+            print("사용법: ai sessions [--tool codex|claude] [--failed]")
+            return
+        print_ai_sessions(filter_ai_sessions(ctx.session_store.load(), tool=tool, failed_only=failed_only))
         return
 
     if subcommand == "show":
         if len(parsed_args) < 2:
             print_error("세션 id를 입력하세요.")
-            print("사용법: ai show <session-id>")
+            print("사용법: ai show <session-id> [--json]")
+            return
+        show_json = False
+        for option in parsed_args[2:]:
+            if option == "--json":
+                show_json = True
+                continue
+            print_error(f"알 수 없는 ai show 옵션입니다: {option}")
+            print("사용법: ai show <session-id> [--json]")
             return
         refresh_project_context(ctx)
         session = ctx.session_store.get(parsed_args[1])
         if not session:
             print_error(f"세션을 찾을 수 없습니다: {parsed_args[1]}")
             return
+        if show_json:
+            print_ai_session_json(session)
+            return
         print_ai_session_detail(session)
+        return
+
+    if subcommand == "rerun":
+        if len(parsed_args) < 2:
+            print_error("재실행할 세션 id를 입력하세요.")
+            print("사용법: ai rerun <session-id>")
+            return
+        if len(parsed_args) > 2:
+            print_error(f"알 수 없는 ai rerun 옵션입니다: {' '.join(parsed_args[2:])}")
+            print("사용법: ai rerun <session-id>")
+            return
+        rerun_ai_session(ctx, parsed_args[1])
         return
 
     if subcommand == "start":
@@ -1777,7 +1937,7 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     print_error(f"알 수 없는 ai 하위 명령입니다: {subcommand}")
-    print("사용법: ai doctor | ai context | ai sessions | ai show <session-id> | ai start <codex|claude> [옵션] [prompt...]")
+    print("사용법: ai doctor | ai context | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
 
 
 @command("codex", "Codex CLI를 세션으로 기록한 뒤 실행합니다.")
