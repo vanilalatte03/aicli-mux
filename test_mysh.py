@@ -189,6 +189,28 @@ class AiContextTests(unittest.TestCase):
             self.assertIn("?? new_notes.txt", output)
             self.assertIn("new context", output)
 
+    @unittest.skipUnless(shutil.which("git") and hasattr(os, "symlink"), "git and symlink support are required")
+    def test_review_context_does_not_preview_untracked_symlink_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            self.write_readme(root)
+            outside = parent / "secret.txt"
+            outside.write_text("outside secret\n", encoding="utf-8")
+            link = root / "notes.txt"
+            try:
+                os.symlink(outside, link)
+            except OSError as exc:
+                self.skipTest(f"symlink creation is unavailable: {exc}")
+
+            output = mysh.build_ai_context(root, mode="review", max_lines=80)
+
+            self.assertIn("?? notes.txt", output)
+            self.assertNotIn("outside secret", output)
+            self.assertNotIn("--- notes.txt (untracked preview", output)
+
     def test_unknown_context_mode_lists_available_modes(self) -> None:
         with self.assertRaises(ValueError) as raised:
             mysh.parse_ai_context_options(["--mode", "unknown"])

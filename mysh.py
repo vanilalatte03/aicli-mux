@@ -1044,11 +1044,20 @@ def untracked_git_files(root: Path) -> List[str]:
     return git_stdout_lines(root, ["ls-files", "--others", "--exclude-standard"], timeout=10.0)
 
 
+def path_is_under_root(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def untracked_file_preview_lines(root: Path, max_files: int = 10, max_preview_lines: int = 20) -> List[str]:
     paths = untracked_git_files(root)
     if not paths:
         return []
 
+    root = root.resolve()
     lines = ["# untracked files"]
     for index, relative_text in enumerate(paths):
         if index >= max_files:
@@ -1056,19 +1065,24 @@ def untracked_file_preview_lines(root: Path, max_files: int = 10, max_preview_li
             break
 
         lines.append(f"?? {relative_text}")
-        path = (root / relative_text).resolve()
+        path = root / relative_text
         try:
-            if not path.is_file() or path.stat().st_size > 200_000:
+            if path.is_symlink():
+                continue
+            resolved = path.resolve()
+            if not path_is_under_root(resolved, root):
+                continue
+            if not resolved.is_file() or resolved.stat().st_size > 200_000:
                 continue
         except OSError:
             continue
 
-        suffix = path.suffix.lower()
+        suffix = resolved.suffix.lower()
         if suffix and suffix not in TEXT_PREVIEW_SUFFIXES:
             continue
 
         lines.append(f"--- {relative_text} (untracked preview, first {max_preview_lines} lines) ---")
-        lines.extend(read_text_preview(path, max_lines=max_preview_lines))
+        lines.extend(read_text_preview(resolved, max_lines=max_preview_lines))
     return lines
 
 
