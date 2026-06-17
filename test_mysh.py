@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -22,6 +24,7 @@ class AiSessionStoreTests(unittest.TestCase):
             created_at="2026-06-17T10:00:00+09:00",
             updated_at="2026-06-17T10:01:00+09:00",
             exit_code=0,
+            args=["--model", "gpt-5"],
         )
 
     def test_session_json_save_and_load(self) -> None:
@@ -115,6 +118,48 @@ class AiCommandBuilderTests(unittest.TestCase):
         self.assertIn("chars=5", summary)
         self.assertNotIn("hello", summary)
 
+    def test_rerunnable_args_keep_flags_but_drop_prompt_and_dangerous_options(self) -> None:
+        args = mysh.extract_rerunnable_ai_args(
+            "codex",
+            ["--model", "gpt-5", "--dangerously-bypass-approvals-and-sandbox", "write", "secret"],
+        )
+
+        self.assertEqual(["--model", "gpt-5"], args)
+
+    def test_rerunnable_args_drop_resume_and_continue_flags(self) -> None:
+        args = mysh.extract_rerunnable_ai_args(
+            "claude",
+            ["--continue", "--resume", "old-session", "-r", "another-session", "--model", "sonnet", "prompt"],
+        )
+
+        self.assertEqual(["--model", "sonnet"], args)
+
+    def test_rerunnable_args_drop_dangerous_value_options(self) -> None:
+        args = mysh.extract_rerunnable_ai_args(
+            "codex",
+            [
+                "-c",
+                "approval_policy=never",
+                "-c",
+                'model="gpt-5"',
+                "--sandbox",
+                "danger-full-access",
+                "--model",
+                "gpt-5",
+                "prompt",
+            ],
+        )
+
+        self.assertEqual(["-c", 'model="gpt-5"', "--model", "gpt-5"], args)
+
+    def test_rerunnable_args_drop_claude_permission_bypass_value(self) -> None:
+        args = mysh.extract_rerunnable_ai_args(
+            "claude",
+            ["--permission-mode", "bypassPermissions", "--model", "sonnet", "prompt"],
+        )
+
+        self.assertEqual(["--model", "sonnet"], args)
+
 
 class InputCompletionTests(unittest.TestCase):
     def test_normalize_input_line_removes_leading_bom(self) -> None:
@@ -130,6 +175,75 @@ class InputCompletionTests(unittest.TestCase):
         self.assertIn("gs", candidates)
         self.assertIn("ai doctor", candidates)
         self.assertIn("ai start codex", candidates)
+
+
+class AiSessionCommandTests(unittest.TestCase):
+    def make_session(self, session_id: str, tool: str, exit_code, cwd: Path) -> mysh.AiSession:
+        return mysh.AiSession(
+            id=session_id,
+            title=f"{tool} session",
+            tool=tool,
+            cwd=str(cwd),
+            command=f"{tool} --model <value> [prompt=no, chars=0, args=0]",
+            profile="default",
+            created_at="2026-06-17T10:00:00+09:00",
+            updated_at=f"2026-06-17T10:0{session_id[-1]}:00+09:00",
+            exit_code=exit_code,
+            args=["--model", "gpt-5"],
+        )
+
+    def test_sessions_filter_by_tool_and_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sessions = [
+                self.make_session("codex-ok-1", "codex", 0, root),
+                self.make_session("codex-fail-2", "codex", 1, root),
+                self.make_session("claude-fail-3", "claude", 2, root),
+                self.make_session("claude-open-4", "claude", None, root),
+            ]
+
+            filtered = mysh.filter_ai_sessions(sessions, tool="codex", failed_only=True)
+
+            self.assertEqual(["codex-fail-2"], [session.id for session in filtered])
+
+    def test_show_json_outputs_valid_session_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self.make_session("codex-json-1", "codex", 0, Path(tmp))
+            output = StringIO()
+
+            with redirect_stdout(output):
+                mysh.print_ai_session_json(session)
+
+            data = json.loads(output.getvalue())
+            self.assertEqual("codex-json-1", data["id"])
+            self.assertEqual("codex", data["tool"])
+            self.assertEqual(["--model", "gpt-5"], data["args"])
+
+    def test_ai_rerun_reconstructs_command_from_stored_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = mysh.ShellContext(project_root=root)
+            session = self.make_session("abc123", "codex", 1, root)
+            session.args = ["--model", "gpt-5", "--dangerously-bypass-approvals-and-sandbox", "ignored prompt"]
+            ctx.session_store.add(session)
+            completed = subprocess.CompletedProcess(["codex"], 0)
+
+            with mock.patch("mysh.refresh_project_context", lambda _ctx: None), mock.patch(
+                "mysh.resolve_executable_for_subprocess", return_value="codex"
+            ), mock.patch("mysh.subprocess.run", return_value=completed) as run_mock:
+                exit_code = mysh.rerun_ai_session(ctx, "abc123")
+
+            self.assertEqual(0, exit_code)
+            run_mock.assert_called_once_with(
+                ["codex", "--cd", str(root.resolve()), "--model", "gpt-5"],
+                cwd=str(root.resolve()),
+            )
+            sessions = ctx.session_store.load()
+            self.assertEqual(2, len(sessions))
+            rerun = sessions[-1]
+            self.assertEqual("rerun: codex session", rerun.title)
+            self.assertEqual(0, rerun.exit_code)
+            self.assertEqual(["--model", "gpt-5"], rerun.args)
 
 
 class AiContextTests(unittest.TestCase):
