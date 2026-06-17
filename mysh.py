@@ -144,6 +144,14 @@ THEMES = {
 }
 
 
+def default_aliases() -> Dict[str, str]:
+    return {
+        "h": "help",
+        "ll": "ls",
+        "q": "quit",
+    }
+
+
 def color(text: str, ansi_code: str) -> str:
     """색상 코드가 비어 있으면 원문 그대로 반환한다."""
     if not ansi_code:
@@ -203,6 +211,8 @@ AI_SUBCOMMAND_COMPLETIONS = (
     "ai context --mode debug",
     "ai context --mode review",
     "ai context --mode handoff",
+    "ai config",
+    "ai config reset",
     "ai rerun",
     "ai sessions",
     "ai sessions --tool codex",
@@ -455,27 +465,144 @@ class AiSessionStore:
         self.save([])
 
 
+def default_shell_config() -> Dict[str, Any]:
+    return {
+        "theme": "green",
+        "aliases": default_aliases(),
+        "active_profile": None,
+        "default_ai_tool": "codex",
+    }
+
+
+class ShellConfigStore:
+    """프로젝트 루트 아래 .mysh/config.json을 관리한다."""
+
+    def __init__(self, project_root: Path):
+        self.project_root = Path(project_root).resolve()
+        self.store_dir = self.project_root / ".mysh"
+        self.path = self.store_dir / "config.json"
+        self.backup_path = self.store_dir / "config.json.bak"
+
+    def ensure_store_dir(self) -> None:
+        existed = self.store_dir.exists()
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            ensure_mysh_gitignore(self.project_root)
+
+    def load(self) -> Dict[str, Any]:
+        if not self.path.exists():
+            return default_shell_config()
+
+        try:
+            with self.path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            return self.recover_corrupt_store()
+
+        if not isinstance(data, dict):
+            return self.recover_corrupt_store()
+        return normalize_shell_config(data)
+
+    def save(self, config: Dict[str, Any]) -> None:
+        self.ensure_store_dir()
+        payload = normalize_shell_config(config)
+        tmp_path = self.path.with_suffix(".json.tmp")
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        tmp_path.replace(self.path)
+
+    def reset(self) -> Dict[str, Any]:
+        config = default_shell_config()
+        self.save(config)
+        return config
+
+    def recover_corrupt_store(self) -> Dict[str, Any]:
+        self.ensure_store_dir()
+        try:
+            if self.path.exists():
+                shutil.copy2(self.path, self.backup_path)
+        except OSError:
+            pass
+        return self.reset()
+
+
+def normalize_shell_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    defaults = default_shell_config()
+    theme = data.get("theme")
+    if not isinstance(theme, str) or theme not in THEMES:
+        theme = defaults["theme"]
+
+    raw_aliases = data.get("aliases")
+    aliases: Dict[str, str] = {}
+    if isinstance(raw_aliases, dict):
+        for name, value in raw_aliases.items():
+            name_text = str(name).strip()
+            value_text = str(value).strip()
+            if name_text and value_text and not any(char.isspace() for char in name_text):
+                aliases[name_text] = value_text
+    else:
+        aliases = dict(defaults["aliases"])
+
+    active_profile = data.get("active_profile")
+    if active_profile is not None:
+        active_profile = str(active_profile)
+
+    default_ai_tool = data.get("default_ai_tool")
+    if default_ai_tool not in {"codex", "claude"}:
+        default_ai_tool = defaults["default_ai_tool"]
+
+    return {
+        "theme": theme,
+        "aliases": aliases,
+        "active_profile": active_profile,
+        "default_ai_tool": default_ai_tool,
+    }
+
+
 @dataclass
 class ShellContext:
     history: List[str] = field(default_factory=list)
-    aliases: Dict[str, str] = field(
-        default_factory=lambda: {
-            "h": "help",
-            "ll": "ls",
-            "q": "quit",
-        }
-    )
+    aliases: Dict[str, str] = field(default_factory=default_aliases)
     theme: str = "green"
     running: bool = True
     readline_available: bool = False
     input_backend: str = "input"
     project_root: Path = field(default_factory=lambda: detect_project_root(Path.cwd()))
     session_store: AiSessionStore = field(init=False)
+    config_store: ShellConfigStore = field(init=False)
     active_profile: Optional[str] = None
+    default_ai_tool: str = "codex"
 
     def __post_init__(self) -> None:
         self.project_root = self.project_root.resolve()
         self.session_store = AiSessionStore(self.project_root)
+        self.config_store = ShellConfigStore(self.project_root)
+        self.load_config()
+
+    def apply_config(self, config: Dict[str, Any]) -> None:
+        normalized = normalize_shell_config(config)
+        self.theme = normalized["theme"]
+        self.aliases = dict(normalized["aliases"])
+        self.active_profile = normalized["active_profile"]
+        self.default_ai_tool = normalized["default_ai_tool"]
+
+    def current_config(self) -> Dict[str, Any]:
+        return {
+            "theme": self.theme,
+            "aliases": dict(self.aliases),
+            "active_profile": self.active_profile,
+            "default_ai_tool": self.default_ai_tool,
+        }
+
+    def load_config(self) -> None:
+        self.apply_config(self.config_store.load())
+
+    def save_config(self) -> None:
+        self.config_store.save(self.current_config())
+
+    def reset_config(self) -> None:
+        self.apply_config(self.config_store.reset())
 
 
 class ShellExit(Exception):
@@ -572,6 +699,8 @@ def refresh_project_context(ctx: ShellContext) -> None:
     if project_root != ctx.project_root:
         ctx.project_root = project_root
         ctx.session_store = AiSessionStore(project_root)
+        ctx.config_store = ShellConfigStore(project_root)
+        ctx.load_config()
 
 
 def expand_alias(ctx: ShellContext, line: str) -> str:
@@ -1675,9 +1804,11 @@ def run_ai_tool_session(
     """세션을 기록하고 TTY를 상속한 채 실제 Codex/Claude CLI를 실행한다."""
     refresh_project_context(ctx)
     cwd = (cwd_override or Path.cwd()).resolve()
-    session_profile = profile or extract_long_option_value(user_args, "--profile") or ctx.active_profile
-    if profile:
-        ctx.active_profile = profile
+    explicit_profile = profile or extract_long_option_value(user_args, "--profile")
+    session_profile = explicit_profile or ctx.active_profile
+    if explicit_profile:
+        ctx.active_profile = explicit_profile
+        ctx.save_config()
 
     command_args = build_ai_command(tool, user_args, cwd)
     session = create_ai_session(tool, cwd, command_args, title, session_profile, user_args=user_args)
@@ -1819,6 +1950,21 @@ def print_ai_session_json(session: AiSession) -> None:
     print(json.dumps(session.to_dict(), ensure_ascii=False, indent=2))
 
 
+def print_ai_config(ctx: ShellContext) -> None:
+    config = ctx.current_config()
+    print("AI Config")
+    print(f"theme: {config['theme']}")
+    print(f"default_ai_tool: {config['default_ai_tool']}")
+    print(f"active_profile: {config['active_profile'] or '-'}")
+    print("aliases:")
+    aliases = config["aliases"]
+    if aliases:
+        for name in sorted(aliases):
+            print(f"  {name} -> {aliases[name]}")
+    else:
+        print("  (none)")
+
+
 def print_ai_session_detail(session: AiSession) -> None:
     console = rich_console()
     if console is not None and RichPanel is not None:
@@ -1921,6 +2067,19 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
             print("사용법: ai context [--mode debug|review|handoff] [--max-lines N]")
             return
         print_ai_context(ctx, mode=mode, max_lines=max_lines)
+        return
+
+    if subcommand == "config":
+        refresh_project_context(ctx)
+        if len(parsed_args) == 1:
+            print_ai_config(ctx)
+            return
+        if len(parsed_args) == 2 and parsed_args[1].lower() == "reset":
+            ctx.reset_config()
+            print("AI config를 기본값으로 초기화했습니다.")
+            return
+        print_error(f"알 수 없는 ai config 옵션입니다: {' '.join(parsed_args[1:])}")
+        print("사용법: ai config | ai config reset")
         return
 
     if subcommand == "sessions":
@@ -2083,6 +2242,7 @@ def cmd_clear(ctx: ShellContext, args: List[str], raw_args: str) -> None:
 
 @command("theme", "프롬프트 색상 테마를 바꿉니다. 예: theme blue")
 def cmd_theme(ctx: ShellContext, args: List[str], raw_args: str) -> None:
+    refresh_project_context(ctx)
     if not args:
         names = ", ".join(sorted(THEMES))
         print(f"현재 테마: {ctx.theme}")
@@ -2096,11 +2256,13 @@ def cmd_theme(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     ctx.theme = next_theme
+    ctx.save_config()
     print(f"테마를 '{next_theme}'로 바꿨습니다.")
 
 
 @command("alias", "명령어 별칭을 관리합니다. 예: alias gs=git status")
 def cmd_alias(ctx: ShellContext, args: List[str], raw_args: str) -> None:
+    refresh_project_context(ctx)
     text = raw_args.strip()
     if not text:
         if not ctx.aliases:
@@ -2129,11 +2291,13 @@ def cmd_alias(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     ctx.aliases[name] = value
+    ctx.save_config()
     print(f"{name} -> {value}")
 
 
 @command("unalias", "등록된 별칭을 삭제합니다. 예: unalias gs")
 def cmd_unalias(ctx: ShellContext, args: List[str], raw_args: str) -> None:
+    refresh_project_context(ctx)
     if not args:
         print_error("삭제할 별칭 이름을 입력하세요.")
         return
@@ -2144,6 +2308,7 @@ def cmd_unalias(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     del ctx.aliases[name]
+    ctx.save_config()
     print(f"별칭을 삭제했습니다: {name}")
 
 
