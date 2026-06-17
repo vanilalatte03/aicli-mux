@@ -118,11 +118,20 @@ FAILURE_TRACE_KEYWORDS = (
 # 실수 방지용 과속방지턱이다. 정규식 블록리스트는 모든 위험 명령을 잡지 못하고
 # 우회도 가능하므로, 보안 경계로 취급하지 않는다.
 DANGEROUS_COMMAND_PATTERNS = (
-    ("rm -r/rm -rf", re.compile(r"(?<![\w.-])rm(?:\.exe)?\s+-[^\s;&|]*r[^\s;&|]*", re.IGNORECASE)),
+    (
+        "rm -r/rm -rf",
+        re.compile(r"(?<![\w.-])rm(?:\.exe)?(?=[^\n;&|]*(?:\s-[A-Za-z]*r[A-Za-z]*\b|\s--recursive\b))", re.IGNORECASE),
+    ),
     ("del", re.compile(r"(?<![\w.-])del(?:\.exe)?(?![\w.-])", re.IGNORECASE)),
     ("Remove-Item", re.compile(r"(?<![\w-])Remove-Item(?![\w-])", re.IGNORECASE)),
     ("git reset --hard", re.compile(r"\bgit\s+reset\b[^\n;&|]*--hard\b", re.IGNORECASE)),
-    ("git clean", re.compile(r"\bgit\s+clean\b", re.IGNORECASE)),
+    (
+        "git clean",
+        re.compile(
+            r"\bgit\s+clean\b(?![^\n;&|]*(?:\s--(?:dry-run|interactive|help)\b|\s-[A-Za-z]*[nih][A-Za-z]*\b))",
+            re.IGNORECASE,
+        ),
+    ),
     ("DROP TABLE/DATABASE", re.compile(r"\bdrop\s+(?:table|database)\b", re.IGNORECASE)),
     ("mkfs", re.compile(r"(?<![\w.-])mkfs(?:\.[\w.-]+)?\b", re.IGNORECASE)),
     ("> /dev/", re.compile(r">\s*/dev/", re.IGNORECASE)),
