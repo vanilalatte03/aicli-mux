@@ -260,6 +260,60 @@ class InputCompletionTests(unittest.TestCase):
         self.assertIn("ai start codex", candidates)
 
 
+class ExternalCommandSafetyTests(unittest.TestCase):
+    def test_dangerous_command_patterns_are_detected(self) -> None:
+        dangerous = [
+            "rm -rf build",
+            "rm -r old",
+            "DEL C:\\temp\\old.txt",
+            "Remove-Item -Recurse C:\\temp\\old",
+            "git reset --hard HEAD",
+            "git clean -fdx",
+            "DROP TABLE users",
+            "drop database app",
+            "mkfs.ext4 /dev/sdb1",
+            "cat image.iso > /dev/sda",
+            ":(){ :|:& };:",
+        ]
+
+        for command in dangerous:
+            with self.subTest(command=command):
+                self.assertIsNotNone(mysh.detect_dangerous_command(command))
+
+    def test_safe_command_patterns_are_not_detected(self) -> None:
+        safe = [
+            "git status",
+            "git reset --soft HEAD~1",
+            "git cleanly formatted docs",
+            "echo hello",
+            "drop tablet notes",
+            "model train",
+        ]
+
+        for command in safe:
+            with self.subTest(command=command):
+                self.assertIsNone(mysh.detect_dangerous_command(command))
+
+    def test_bang_escape_hatch_skips_safety_confirmation(self) -> None:
+        ctx = mysh.ShellContext()
+
+        with mock.patch("mysh.run_external_command") as run_mock:
+            mysh.execute_line(ctx, "!rm -rf build")
+
+        run_mock.assert_called_once_with("rm -rf build", bypass_safety=True)
+
+    def test_noninteractive_dangerous_command_is_blocked(self) -> None:
+        output = StringIO()
+
+        with mock.patch("mysh.is_interactive_stdin", return_value=False), mock.patch(
+            "mysh.subprocess.run"
+        ) as run_mock, redirect_stdout(output):
+            mysh.run_external_command("rm -rf build")
+
+        run_mock.assert_not_called()
+        self.assertIn("차단", output.getvalue())
+
+
 class AiSessionCommandTests(unittest.TestCase):
     def make_session(self, session_id: str, tool: str, exit_code, cwd: Path) -> mysh.AiSession:
         return mysh.AiSession(

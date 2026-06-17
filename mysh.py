@@ -11,6 +11,7 @@ import ctypes
 import datetime as _dt
 import json
 import os
+import re
 import shutil
 import shlex
 import subprocess
@@ -113,6 +114,19 @@ FAILURE_TRACE_KEYWORDS = (
     "error",
     "exception",
     "assertionerror",
+)
+# 실수 방지용 과속방지턱이다. 정규식 블록리스트는 모든 위험 명령을 잡지 못하고
+# 우회도 가능하므로, 보안 경계로 취급하지 않는다.
+DANGEROUS_COMMAND_PATTERNS = (
+    ("rm -r/rm -rf", re.compile(r"(?<![\w.-])rm(?:\.exe)?\s+-[^\s;&|]*r[^\s;&|]*", re.IGNORECASE)),
+    ("del", re.compile(r"(?<![\w.-])del(?:\.exe)?(?![\w.-])", re.IGNORECASE)),
+    ("Remove-Item", re.compile(r"(?<![\w-])Remove-Item(?![\w-])", re.IGNORECASE)),
+    ("git reset --hard", re.compile(r"\bgit\s+reset\b[^\n;&|]*--hard\b", re.IGNORECASE)),
+    ("git clean", re.compile(r"\bgit\s+clean\b", re.IGNORECASE)),
+    ("DROP TABLE/DATABASE", re.compile(r"\bdrop\s+(?:table|database)\b", re.IGNORECASE)),
+    ("mkfs", re.compile(r"(?<![\w.-])mkfs(?:\.[\w.-]+)?\b", re.IGNORECASE)),
+    ("> /dev/", re.compile(r">\s*/dev/", re.IGNORECASE)),
+    ("fork bomb", re.compile(r":\s*\(\s*\)\s*\{", re.IGNORECASE)),
 )
 
 
@@ -693,6 +707,11 @@ def print_error(message: str) -> None:
     print(color(f"오류: {message}", Ansi.RED))
 
 
+def print_warning(message: str) -> None:
+    """경고 메시지는 한곳에서 같은 형식으로 출력한다."""
+    print(color(f"경고: {message}", Ansi.YELLOW))
+
+
 def refresh_project_context(ctx: ShellContext) -> None:
     """현재 cwd 기준 프로젝트 루트가 바뀌었으면 세션 저장소도 바꾼다."""
     project_root = detect_project_root(Path.cwd())
@@ -721,10 +740,59 @@ def expand_alias(ctx: ShellContext, line: str) -> str:
     raise ValueError("별칭 확장이 너무 깊습니다.")
 
 
-def run_external_command(line: str) -> None:
+def detect_dangerous_command(line: str) -> Optional[str]:
+    """명백히 파괴적인 외부 명령 패턴을 찾는다."""
+    for label, pattern in DANGEROUS_COMMAND_PATTERNS:
+        if pattern.search(line):
+            return label
+    return None
+
+
+def is_interactive_stdin() -> bool:
+    """파이프/리다이렉션 입력에서는 확인 프롬프트를 받을 수 없다."""
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def confirm_dangerous_command(line: str, reason: str) -> bool:
+    """위험 명령 실행 전 y/N 확인을 받는다. 기본값은 N이다."""
+    print_warning(f"위험할 수 있는 외부 명령 패턴을 감지했습니다: {reason}")
+    print(line)
+    try:
+        answer = input("계속 실행할까요? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def should_run_external_command(line: str, bypass_safety: bool = False) -> bool:
+    """OS 셸로 넘기기 전 위험 명령 과속방지턱을 적용한다."""
+    if bypass_safety:
+        return True
+
+    reason = detect_dangerous_command(line)
+    if not reason:
+        return True
+
+    if not is_interactive_stdin():
+        print_warning(f"비대화형 입력에서는 확인할 수 없어 위험 명령을 차단했습니다: {reason}")
+        return False
+
+    if confirm_dangerous_command(line, reason):
+        return True
+
+    print_warning("외부 명령을 실행하지 않았습니다.")
+    return False
+
+
+def run_external_command(line: str, bypass_safety: bool = False) -> None:
     """등록되지 않은 명령은 실제 OS 셸에 넘겨 실행을 시도한다."""
     if not line.strip():
         print_error("실행할 외부 명령을 입력하세요.")
+        return
+    if not should_run_external_command(line, bypass_safety=bypass_safety):
         return
 
     try:
@@ -752,7 +820,7 @@ def run_external_command(line: str) -> None:
 def execute_line(ctx: ShellContext, line: str) -> None:
     """입력 한 줄을 내장 명령 또는 외부 명령으로 실행한다."""
     if line.startswith("!"):
-        run_external_command(line[1:].lstrip())
+        run_external_command(line[1:].lstrip(), bypass_safety=True)
         return
 
     try:
@@ -2032,6 +2100,10 @@ def cmd_help(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         print("\n별칭:")
         for name in sorted(ctx.aliases):
             print(f"  {name} -> {ctx.aliases[name]}")
+
+    print("\n안전장치:")
+    print("  미등록 외부 명령이 명백히 위험한 패턴이면 y/N 확인 후 실행합니다.")
+    print("  !<명령>은 내장/별칭과 이 확인을 의도적으로 우회합니다.")
 
 
 @command("ai", "AI 작업 보조 명령입니다. 예: ai doctor, ai sessions, ai start codex")
