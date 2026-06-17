@@ -45,7 +45,7 @@ python mysh.py
 | 명령 | 설명 |
 |------|------|
 | `ai doctor` | Python·Git·Codex·Claude 환경 점검 |
-| `ai context [--mode debug\|review\|handoff] [--max-lines N]` | 기본/디버그/리뷰/인수인계용 plain-text 컨텍스트 팩 출력 |
+| `ai context [--mode debug\|review\|handoff\|ship] [--max-lines N]` | 기본/디버그/리뷰/인수인계/출시용 plain-text 컨텍스트 팩 출력 |
 | `ai config` / `ai config reset` | 프로젝트별 theme, alias, 기본 AI tool/profile 설정 출력 / 초기화 |
 | `ai policy` / `ai policy init` | 적용 중인 외부 명령 정책 출력 / 기본 정책 파일 생성 |
 | `ai task new <goal>` / `ai task list` / `ai task show <id>` | AI 세션을 작업 단위로 묶고 Git baseline/변경 파일을 추적 |
@@ -56,6 +56,8 @@ python mysh.py
 | `ai start codex [--title T] [--profile P] [prompt...]` | 세션 기록 후 Codex 실행 |
 | `ai start claude [--title T] [--profile P] [prompt...]` | 세션 기록 후 Claude 실행 |
 | `codex ...` / `claude ...` | 세션을 먼저 기록한 뒤 실제 CLI에 위임 |
+
+`ai context`는 active task가 있으면 출력 상단에 현재 작업(goal/변경 파일 요약)을 붙이고, `handoff`/`ship` 모드에서는 다음 액션·연결 세션·테스트 상태를 추가로 반영합니다.
 
 등록되지 않은 명령은 OS 셸 명령으로 실행을 시도합니다. 실행 직전 `.mysh/policy.json` 정책이 있으면 그 파일을, 없으면 내장 기본 정책을 적용합니다. 정책 규칙은 `{ "match": "<정규식>", "action": "allow|ask|deny", "reason": "<설명>" }` 형태이며, `ai policy init`으로 기본 파일을 만들 수 있습니다. `ask`는 y/N 확인을 받고 비대화형 입력에서는 차단합니다. `deny`는 항상 차단되며, `!<명령>` escape hatch도 `ask`만 건너뛰고 `deny`는 건너뛰지 않습니다. 해제하려면 정책 파일을 수정해야 합니다.
 
