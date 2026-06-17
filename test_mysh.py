@@ -889,6 +889,42 @@ class AiContextTests(unittest.TestCase):
         lines = ["# Demo", "", *[f"line {index}" for index in range(line_count)]]
         (root / "README.md").write_text("\n".join(lines), encoding="utf-8")
 
+    def make_task(
+        self,
+        root: Path,
+        goal: str = "finish context task",
+        session_ids=None,
+        next_action=None,
+        test_result=None,
+    ) -> mysh.AiTask:
+        return mysh.AiTask(
+            id="task123",
+            goal=goal,
+            cwd=str(root),
+            status="active",
+            created_at="2026-06-17T10:00:00+09:00",
+            updated_at="2026-06-17T10:01:00+09:00",
+            session_ids=list(session_ids or []),
+            git_baseline=None,
+            changed_files=None,
+            test_result=test_result,
+            next_action=next_action,
+        )
+
+    def make_session(self, root: Path) -> mysh.AiSession:
+        return mysh.AiSession(
+            id="sess123",
+            title="context work",
+            tool="codex",
+            cwd=str(root),
+            command="codex [prompt=yes, chars=12, args=0]",
+            profile=None,
+            created_at="2026-06-17T10:00:00+09:00",
+            updated_at="2026-06-17T10:02:00+09:00",
+            exit_code=0,
+            args=[],
+        )
+
     @unittest.skipUnless(shutil.which("git"), "git executable is required")
     def test_context_modes_return_text_in_git_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -898,12 +934,107 @@ class AiContextTests(unittest.TestCase):
             (root / "mysh.py").write_text("print('hi')\n", encoding="utf-8")
             store = mysh.AiSessionStore(root)
 
-            for mode in ("default", "debug", "review", "handoff"):
+            for mode in ("default", "debug", "review", "handoff", "ship"):
                 with self.subTest(mode=mode):
                     output = mysh.build_ai_context(root, mode=mode, session_store=store)
 
                     self.assertIn("## AI Context", output)
                     self.assertIn(f"Mode: {mode}", output)
+
+    def test_context_includes_active_task_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_readme(root)
+            task_store = mysh.AiTaskStore(root)
+            task_store.add(self.make_task(root, goal="wire task into context"))
+
+            output = mysh.build_ai_context(root, mode="default", task_store=task_store)
+
+        self.assertIn("## 현재 작업", output)
+        self.assertIn("goal: wire task into context", output)
+        self.assertIn("changed_files:", output)
+
+    def test_handoff_context_includes_active_task_next_action_and_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_readme(root)
+            session_store = mysh.AiSessionStore(root)
+            session_store.add(self.make_session(root))
+            task_store = mysh.AiTaskStore(root)
+            task_store.add(
+                self.make_task(
+                    root,
+                    session_ids=["sess123"],
+                    next_action="open the final PR",
+                )
+            )
+
+            output = mysh.build_ai_context(
+                root,
+                mode="handoff",
+                session_store=session_store,
+                task_store=task_store,
+            )
+
+        self.assertIn("next_action: open the final PR", output)
+        self.assertIn("linked_sessions:", output)
+        self.assertIn("sess123 codex exit=0", output)
+
+    @unittest.skipUnless(shutil.which("git"), "git executable is required")
+    def test_ship_context_includes_task_test_result_and_untracked_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            self.write_readme(root)
+            (root / "ship_notes.txt").write_text("ship this\n", encoding="utf-8")
+            task_store = mysh.AiTaskStore(root)
+            task_store.add(self.make_task(root, test_result="python -m unittest test_mysh: OK"))
+
+            output = mysh.build_ai_context(
+                root,
+                mode="ship",
+                max_lines=120,
+                task_store=task_store,
+            )
+
+        self.assertIn("Mode: ship", output)
+        self.assertIn("test_result: python -m unittest test_mysh: OK", output)
+        self.assertIn("## Ship Changes", output)
+        self.assertIn("## Uncommitted/Untracked Preview", output)
+        self.assertIn("?? ship_notes.txt", output)
+
+    @unittest.skipUnless(shutil.which("git"), "git executable is required")
+    def test_ship_context_includes_committed_branch_changes_when_worktree_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "branch", "-M", "main"], cwd=root, capture_output=True, text=True, check=True)
+            self.write_readme(root)
+            subprocess.run(["git", "add", "README.md"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            subprocess.run(["git", "switch", "-c", "feature"], cwd=root, capture_output=True, text=True, check=True)
+            (root / "README.md").write_text("# Demo\n\nchanged\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "change readme"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            output = mysh.build_ai_context(root, mode="ship", max_lines=120)
+
+        self.assertIn("Committed changes (main...HEAD):", output)
+        self.assertIn("M\tREADME.md", output)
+        self.assertIn("Uncommitted files:", output)
+        self.assertIn("  (none)", output)
 
     def test_context_max_lines_limits_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -97,12 +97,13 @@ TEXT_PREVIEW_SUFFIXES = {
     ".yml",
 }
 GIT_EMPTY_TREE_SHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-AI_CONTEXT_MODES = ("default", "debug", "review", "handoff")
+AI_CONTEXT_MODES = ("default", "debug", "review", "handoff", "ship")
 AI_CONTEXT_DEFAULT_MAX_LINES = {
     "default": 200,
     "debug": 220,
     "review": 240,
     "handoff": 240,
+    "ship": 240,
 }
 AI_CONTEXT_TEST_HINTS = (
     "python -m py_compile mysh.py",
@@ -239,6 +240,7 @@ AI_SUBCOMMAND_COMPLETIONS = (
     "ai context --mode debug",
     "ai context --mode review",
     "ai context --mode handoff",
+    "ai context --mode ship",
     "ai config",
     "ai config reset",
     "ai policy",
@@ -2194,6 +2196,76 @@ def ai_session_summary_lines(session_store: Optional[AiSessionStore]) -> List[st
     return lines
 
 
+def task_changed_file_summary_lines(task: AiTask, max_files: int = 8) -> List[str]:
+    changed_files = task_changed_files_for_display(task)
+    if changed_files is None:
+        return ["changed_files: -"]
+    if not changed_files:
+        return ["changed_files: (없음)"]
+
+    lines = ["changed_files:"]
+    for path in changed_files[:max_files]:
+        lines.append(f"  {path}")
+    if len(changed_files) > max_files:
+        lines.append(f"  ... ({len(changed_files) - max_files}개 더 있음)")
+    return lines
+
+
+def task_linked_session_summary_lines(task: AiTask, session_store: Optional[AiSessionStore]) -> List[str]:
+    if not task.session_ids:
+        return ["  (연결된 세션 없음)"]
+    if session_store is None:
+        return [f"  - {session_id} (세션 저장소 없음)" for session_id in task.session_ids[-5:]]
+
+    sessions_by_id = {session.id: session for session in session_store.load()}
+    lines = []
+    for session_id in task.session_ids[-5:]:
+        session = sessions_by_id.get(session_id)
+        if session is None:
+            lines.append(f"  - {session_id} (메타데이터 없음)")
+            continue
+        exit_code = "-" if session.exit_code is None else str(session.exit_code)
+        title = shorten(session.title, 40)
+        lines.append(f"  - {session.id} {session.tool} exit={exit_code} updated={session.updated_at} title={title}")
+    return lines
+
+
+def active_task_context_lines(
+    task_store: Optional[AiTaskStore],
+    session_store: Optional[AiSessionStore],
+    mode: str,
+) -> List[str]:
+    if task_store is None:
+        return []
+    task = task_store.current()
+    if task is None:
+        return []
+
+    body = [
+        f"id: {task.id}",
+        f"goal: {task.goal}",
+        f"status: {task.status}",
+    ]
+    body.extend(task_changed_file_summary_lines(task))
+    if mode == "ship":
+        body.append(f"test_result: {task.test_result or '-'}")
+    if mode == "handoff":
+        body.append(f"next_action: {task.next_action or '-'}")
+        body.append("linked_sessions:")
+        body.extend(task_linked_session_summary_lines(task, session_store))
+    return section_lines("현재 작업", body)
+
+
+def insert_context_after_header(lines: List[str], inserted: List[str]) -> List[str]:
+    if not inserted:
+        return lines
+    try:
+        insert_at = lines.index("") + 1
+    except ValueError:
+        insert_at = 0
+    return [*lines[:insert_at], *inserted, *lines[insert_at:]]
+
+
 def readme_section_lines(root: Path, max_lines: int, title: str = "README") -> List[str]:
     readme = find_readme(root)
     if not readme:
@@ -2262,11 +2334,56 @@ def build_handoff_context(root: Path, session_store: Optional[AiSessionStore]) -
     return lines
 
 
+def ship_committed_change_lines(root: Path) -> tuple[Optional[str], List[str]]:
+    for base_ref in ("main", "origin/main"):
+        comparison = f"{base_ref}...HEAD"
+        result = git_result(["diff", "--name-status", comparison, "--"], timeout=10.0, cwd=root)
+        if result and result.returncode == 0:
+            return comparison, result.stdout.splitlines()
+    return None, []
+
+
+def ship_change_summary_lines(root: Path) -> List[str]:
+    if not is_git_repository(root):
+        return ["Git repository: no"]
+
+    comparison, committed_changes = ship_committed_change_lines(root)
+    lines = [f"Branch: {current_git_branch(root)}"]
+    lines.append(f"Committed changes ({comparison or 'base unavailable'}):")
+    lines.extend([f"  {change}" for change in committed_changes] or ["  (none)"])
+
+    uncommitted_changes = changed_git_files(root)
+    lines.append("Uncommitted files:")
+    lines.extend([f"  {change}" for change in uncommitted_changes] or ["  (none)"])
+
+    diff_stat = git_stdout_lines(root, ["diff", "--stat", comparison, "--"], timeout=10.0) if comparison else []
+    if diff_stat:
+        lines.append("Diff stat:")
+        lines.extend([f"  {line}" for line in diff_stat])
+    return lines
+
+
+def build_ship_context(root: Path, session_store: Optional[AiSessionStore]) -> List[str]:
+    _ = session_store
+    lines = section_lines("AI Context", [f"CWD: {root}", "Mode: ship"])
+    lines.extend(section_lines("Ship Changes", ship_change_summary_lines(root)))
+    lines.extend(
+        section_lines(
+            "Test Status/Commands",
+            ["Status: see current task test_result if present", *test_command_hint_lines()],
+        )
+    )
+    if is_git_repository(root):
+        lines.extend(section_lines("Uncommitted/Untracked Preview", review_diff_lines(root)))
+    return lines
+
+
 def build_ai_context(
     root: Path,
     mode: str = "default",
     max_lines: Optional[int] = None,
     session_store: Optional[AiSessionStore] = None,
+    task_store: Optional[AiTaskStore] = None,
 ) -> str:
     """AI에 붙여넣기 좋은 plain-text context pack을 만든다."""
     normalized_mode = mode.lower()
@@ -2280,8 +2397,10 @@ def build_ai_context(
         "debug": build_debug_context,
         "review": build_review_context,
         "handoff": build_handoff_context,
+        "ship": build_ship_context,
     }
     lines = builders[normalized_mode](root, session_store)
+    lines = insert_context_after_header(lines, active_task_context_lines(task_store, session_store, normalized_mode))
     limit = max_lines if max_lines is not None else AI_CONTEXT_DEFAULT_MAX_LINES[normalized_mode]
     return "\n".join(limit_context_lines(lines, limit)).rstrip() + "\n"
 
@@ -2328,7 +2447,16 @@ def parse_ai_context_options(args: List[str]) -> tuple[str, Optional[int]]:
 
 def print_ai_context(ctx: ShellContext, mode: str = "default", max_lines: Optional[int] = None) -> None:
     refresh_project_context(ctx)
-    print(build_ai_context(Path.cwd(), mode=mode, max_lines=max_lines, session_store=ctx.session_store), end="")
+    print(
+        build_ai_context(
+            Path.cwd(),
+            mode=mode,
+            max_lines=max_lines,
+            session_store=ctx.session_store,
+            task_store=ctx.task_store,
+        ),
+        end="",
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -3179,7 +3307,7 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         except ValueError as exc:
             print_error(str(exc))
             print(f"사용 가능 모드: {', '.join(AI_CONTEXT_MODES)}")
-            print("사용법: ai context [--mode debug|review|handoff] [--max-lines N]")
+            print("사용법: ai context [--mode debug|review|handoff|ship] [--max-lines N]")
             return
         print_ai_context(ctx, mode=mode, max_lines=max_lines)
         return
