@@ -1804,9 +1804,10 @@ def run_ai_tool_session(
     """세션을 기록하고 TTY를 상속한 채 실제 Codex/Claude CLI를 실행한다."""
     refresh_project_context(ctx)
     cwd = (cwd_override or Path.cwd()).resolve()
-    session_profile = profile or extract_long_option_value(user_args, "--profile") or ctx.active_profile
-    if profile:
-        ctx.active_profile = profile
+    explicit_profile = profile or extract_long_option_value(user_args, "--profile")
+    session_profile = explicit_profile or ctx.active_profile
+    if explicit_profile:
+        ctx.active_profile = explicit_profile
         ctx.save_config()
 
     command_args = build_ai_command(tool, user_args, cwd)
@@ -2241,6 +2242,7 @@ def cmd_clear(ctx: ShellContext, args: List[str], raw_args: str) -> None:
 
 @command("theme", "프롬프트 색상 테마를 바꿉니다. 예: theme blue")
 def cmd_theme(ctx: ShellContext, args: List[str], raw_args: str) -> None:
+    refresh_project_context(ctx)
     if not args:
         names = ", ".join(sorted(THEMES))
         print(f"현재 테마: {ctx.theme}")
@@ -2260,6 +2262,7 @@ def cmd_theme(ctx: ShellContext, args: List[str], raw_args: str) -> None:
 
 @command("alias", "명령어 별칭을 관리합니다. 예: alias gs=git status")
 def cmd_alias(ctx: ShellContext, args: List[str], raw_args: str) -> None:
+    refresh_project_context(ctx)
     text = raw_args.strip()
     if not text:
         if not ctx.aliases:
@@ -2294,6 +2297,7 @@ def cmd_alias(ctx: ShellContext, args: List[str], raw_args: str) -> None:
 
 @command("unalias", "등록된 별칭을 삭제합니다. 예: unalias gs")
 def cmd_unalias(ctx: ShellContext, args: List[str], raw_args: str) -> None:
+    refresh_project_context(ctx)
     if not args:
         print_error("삭제할 별칭 이름을 입력하세요.")
         return

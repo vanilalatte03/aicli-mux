@@ -121,6 +121,34 @@ class ShellConfigStoreTests(unittest.TestCase):
             self.assertIsNone(ctx.active_profile)
             self.assertEqual("codex", ctx.default_ai_tool)
 
+    def test_alias_save_refreshes_project_context_after_cd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            project_a = parent / "project-a"
+            project_b = parent / "project-b"
+            project_a.mkdir()
+            project_b.mkdir()
+            ctx = mysh.ShellContext(project_root=project_a)
+            ctx.aliases = {}
+            ctx.save_config()
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(project_b)
+                output = StringIO()
+                with redirect_stdout(output):
+                    mysh.cmd_alias(ctx, [], "gs=git status")
+            finally:
+                os.chdir(original_cwd)
+
+            with (project_b / ".mysh" / "config.json").open("r", encoding="utf-8") as file:
+                project_b_config = json.load(file)
+            with (project_a / ".mysh" / "config.json").open("r", encoding="utf-8") as file:
+                project_a_config = json.load(file)
+
+            self.assertEqual("git status", project_b_config["aliases"]["gs"])
+            self.assertEqual({}, project_a_config["aliases"])
+
 
 class AiCommandBuilderTests(unittest.TestCase):
     def test_codex_command_adds_default_cd(self) -> None:
@@ -299,6 +327,30 @@ class AiSessionCommandTests(unittest.TestCase):
             self.assertEqual("rerun: codex session", rerun.title)
             self.assertEqual(0, rerun.exit_code)
             self.assertEqual(["--model", "gpt-5"], rerun.args)
+
+    def test_run_ai_tool_session_persists_profile_from_user_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = mysh.ShellContext(project_root=root)
+            completed = subprocess.CompletedProcess(["codex"], 0)
+
+            with mock.patch("mysh.refresh_project_context", lambda _ctx: None), mock.patch(
+                "mysh.resolve_executable_for_subprocess", return_value="codex"
+            ), mock.patch("mysh.ensure_mysh_gitignore", lambda _root: None), mock.patch(
+                "mysh.subprocess.run", return_value=completed
+            ):
+                exit_code = mysh.run_ai_tool_session(
+                    ctx,
+                    "codex",
+                    ["--profile", "work", "--model", "gpt-5"],
+                    cwd_override=root,
+                )
+
+            self.assertEqual(0, exit_code)
+            loaded = mysh.ShellContext(project_root=root)
+            self.assertEqual("work", loaded.active_profile)
+            sessions = loaded.session_store.load()
+            self.assertEqual("work", sessions[-1].profile)
 
 
 class AiContextTests(unittest.TestCase):
