@@ -174,6 +174,21 @@ class AiContextTests(unittest.TestCase):
             self.assertIn("## Test Command Hints", output)
             self.assertNotIn("## Git Diff", output)
 
+    @unittest.skipUnless(shutil.which("git"), "git executable is required")
+    def test_review_context_includes_untracked_file_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            self.write_readme(root)
+            untracked = root / "new_notes.txt"
+            untracked.write_text("new context\nsecond line\n", encoding="utf-8")
+
+            output = mysh.build_ai_context(root, mode="review", max_lines=80)
+
+            self.assertIn("# untracked files", output)
+            self.assertIn("?? new_notes.txt", output)
+            self.assertIn("new context", output)
+
     def test_unknown_context_mode_lists_available_modes(self) -> None:
         with self.assertRaises(ValueError) as raised:
             mysh.parse_ai_context_options(["--mode", "unknown"])

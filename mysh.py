@@ -1040,11 +1040,44 @@ def git_diff_lines(root: Path, args: List[str]) -> List[str]:
     return lines or ["(diff 없음)"]
 
 
+def untracked_git_files(root: Path) -> List[str]:
+    return git_stdout_lines(root, ["ls-files", "--others", "--exclude-standard"], timeout=10.0)
+
+
+def untracked_file_preview_lines(root: Path, max_files: int = 10, max_preview_lines: int = 20) -> List[str]:
+    paths = untracked_git_files(root)
+    if not paths:
+        return []
+
+    lines = ["# untracked files"]
+    for index, relative_text in enumerate(paths):
+        if index >= max_files:
+            lines.append(f"... ({len(paths) - max_files}개 untracked 파일 생략)")
+            break
+
+        lines.append(f"?? {relative_text}")
+        path = (root / relative_text).resolve()
+        try:
+            if not path.is_file() or path.stat().st_size > 200_000:
+                continue
+        except OSError:
+            continue
+
+        suffix = path.suffix.lower()
+        if suffix and suffix not in TEXT_PREVIEW_SUFFIXES:
+            continue
+
+        lines.append(f"--- {relative_text} (untracked preview, first {max_preview_lines} lines) ---")
+        lines.extend(read_text_preview(path, max_lines=max_preview_lines))
+    return lines
+
+
 def review_diff_lines(root: Path) -> List[str]:
     """스테이징+작업 트리 diff를 한 덩어리로 보여준다."""
     combined = git_stdout_lines(root, ["diff", "HEAD", "--"], timeout=10.0)
+    untracked = untracked_file_preview_lines(root)
     if combined:
-        return combined
+        return [*combined, *([] if not untracked else ["", *untracked])]
 
     cached = git_stdout_lines(root, ["diff", "--cached", "--"], timeout=10.0)
     working = git_stdout_lines(root, ["diff", "--"], timeout=10.0)
@@ -1055,6 +1088,10 @@ def review_diff_lines(root: Path) -> List[str]:
         if lines:
             lines.append("")
         lines.extend(["# working tree", *working])
+    if untracked:
+        if lines:
+            lines.append("")
+        lines.extend(untracked)
     return lines or ["(diff 없음)"]
 
 
