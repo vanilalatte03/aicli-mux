@@ -81,6 +81,39 @@ STATUS_WARN = "경고"
 STATUS_NONE = "없음"
 
 TREE_EXCLUDED_NAMES = {".git", "node_modules", "__pycache__", ".mysh"}
+TEXT_PREVIEW_SUFFIXES = {
+    ".cfg",
+    ".ini",
+    ".json",
+    ".log",
+    ".md",
+    ".py",
+    ".rst",
+    ".text",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+AI_CONTEXT_MODES = ("default", "debug", "review", "handoff")
+AI_CONTEXT_DEFAULT_MAX_LINES = {
+    "default": 200,
+    "debug": 220,
+    "review": 240,
+    "handoff": 240,
+}
+AI_CONTEXT_TEST_HINTS = (
+    "python -m py_compile mysh.py",
+    "python -m unittest test_mysh",
+)
+FAILURE_TRACE_KEYWORDS = (
+    "traceback",
+    "failed",
+    "failure",
+    "error",
+    "exception",
+    "assertionerror",
+)
 
 
 THEMES = {
@@ -167,6 +200,9 @@ COMMANDS: Dict[str, Command] = {}
 AI_SUBCOMMAND_COMPLETIONS = (
     "ai doctor",
     "ai context",
+    "ai context --mode debug",
+    "ai context --mode review",
+    "ai context --mode handoff",
     "ai sessions",
     "ai show",
     "ai start",
@@ -751,7 +787,11 @@ def read_shell_line(ctx: ShellContext, prompt_session: Optional[Any]) -> str:
 # -----------------------------------------------------------------------------
 
 
-def run_tool(args: List[str], timeout: float = 5.0) -> Optional[subprocess.CompletedProcess[str]]:
+def run_tool(
+    args: List[str],
+    timeout: float = 5.0,
+    cwd: Optional[Path] = None,
+) -> Optional[subprocess.CompletedProcess[str]]:
     """짧은 외부 도구 호출을 안전하게 실행하고 실패는 None으로 돌려준다."""
     try:
         return subprocess.run(
@@ -762,6 +802,7 @@ def run_tool(args: List[str], timeout: float = 5.0) -> Optional[subprocess.Compl
             errors="replace",
             timeout=timeout,
             check=False,
+            cwd=str(cwd) if cwd is not None else None,
         )
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return None
@@ -775,37 +816,41 @@ def first_output_line(result: subprocess.CompletedProcess[str]) -> str:
     return output.splitlines()[0].strip()
 
 
-def git_result(args: List[str], timeout: float = 5.0) -> Optional[subprocess.CompletedProcess[str]]:
+def git_result(
+    args: List[str],
+    timeout: float = 5.0,
+    cwd: Optional[Path] = None,
+) -> Optional[subprocess.CompletedProcess[str]]:
     """Git 명령을 실행한다. Git이 없거나 실패하면 호출자가 상태를 판단한다."""
-    return run_tool(["git", *args], timeout=timeout)
+    return run_tool(["git", *args], timeout=timeout, cwd=cwd)
 
 
-def is_git_repository() -> bool:
-    result = git_result(["rev-parse", "--is-inside-work-tree"])
+def is_git_repository(root: Optional[Path] = None) -> bool:
+    result = git_result(["rev-parse", "--is-inside-work-tree"], cwd=root)
     return bool(result and result.returncode == 0 and result.stdout.strip() == "true")
 
 
-def current_git_branch() -> str:
-    branch = git_result(["branch", "--show-current"])
+def current_git_branch(root: Optional[Path] = None) -> str:
+    branch = git_result(["branch", "--show-current"], cwd=root)
     if branch and branch.returncode == 0 and branch.stdout.strip():
         return branch.stdout.strip()
 
-    commit = git_result(["rev-parse", "--short", "HEAD"])
+    commit = git_result(["rev-parse", "--short", "HEAD"], cwd=root)
     if commit and commit.returncode == 0 and commit.stdout.strip():
         return f"detached HEAD ({commit.stdout.strip()})"
 
     return "(알 수 없음)"
 
 
-def changed_git_files() -> List[str]:
-    status = git_result(["status", "--porcelain"])
+def changed_git_files(root: Optional[Path] = None) -> List[str]:
+    status = git_result(["status", "--porcelain"], cwd=root)
     if not status or status.returncode != 0:
         return []
     return [line for line in status.stdout.splitlines() if line.strip()]
 
 
-def recent_git_commits(limit: int = 3) -> List[str]:
-    result = git_result(["log", "--oneline", f"-{limit}"])
+def recent_git_commits(limit: int = 3, root: Optional[Path] = None) -> List[str]:
+    result = git_result(["log", "--oneline", f"-{limit}"], cwd=root)
     if not result or result.returncode != 0:
         return []
     return [line for line in result.stdout.splitlines() if line.strip()]
@@ -963,43 +1008,321 @@ def file_tree_lines(root: Path, max_depth: int = 2, max_items: int = 100) -> Lis
     return lines
 
 
-def print_ai_context() -> None:
-    root = Path.cwd().resolve()
-    print("=== AI Context ===")
-    print(f"CWD: {root}")
+def section_lines(title: str, body: List[str]) -> List[str]:
+    """복사·파싱하기 쉬운 Markdown 스타일 섹션을 만든다."""
+    lines = [f"## {title}"]
+    lines.extend(body or ["(없음)"])
+    lines.append("")
+    return lines
 
+
+def limit_context_lines(lines: List[str], max_lines: int) -> List[str]:
+    """전체 context 출력 줄 수를 제한하고 마지막 줄에 생략 수를 남긴다."""
+    if len(lines) <= max_lines:
+        return lines
+    if max_lines <= 1:
+        return [f"(생략됨: {len(lines)}줄)"]
+
+    kept = max_lines - 1
+    omitted = len(lines) - kept
+    return [*lines[:kept], f"(생략됨: {omitted}줄)"]
+
+
+def git_stdout_lines(root: Path, args: List[str], timeout: float = 10.0) -> List[str]:
+    result = git_result(args, timeout=timeout, cwd=root)
+    if not result or result.returncode != 0:
+        return []
+    return result.stdout.splitlines()
+
+
+def git_diff_lines(root: Path, args: List[str]) -> List[str]:
+    lines = git_stdout_lines(root, args, timeout=10.0)
+    return lines or ["(diff 없음)"]
+
+
+def untracked_git_files(root: Path) -> List[str]:
+    return git_stdout_lines(root, ["ls-files", "--others", "--exclude-standard"], timeout=10.0)
+
+
+def path_is_under_root(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def untracked_file_preview_lines(root: Path, max_files: int = 10, max_preview_lines: int = 20) -> List[str]:
+    paths = untracked_git_files(root)
+    if not paths:
+        return []
+
+    root = root.resolve()
+    lines = ["# untracked files"]
+    for index, relative_text in enumerate(paths):
+        if index >= max_files:
+            lines.append(f"... ({len(paths) - max_files}개 untracked 파일 생략)")
+            break
+
+        lines.append(f"?? {relative_text}")
+        path = root / relative_text
+        try:
+            if path.is_symlink():
+                continue
+            resolved = path.resolve()
+            if not path_is_under_root(resolved, root):
+                continue
+            if not resolved.is_file() or resolved.stat().st_size > 200_000:
+                continue
+        except OSError:
+            continue
+
+        suffix = resolved.suffix.lower()
+        if suffix and suffix not in TEXT_PREVIEW_SUFFIXES:
+            continue
+
+        lines.append(f"--- {relative_text} (untracked preview, first {max_preview_lines} lines) ---")
+        lines.extend(read_text_preview(resolved, max_lines=max_preview_lines))
+    return lines
+
+
+def review_diff_lines(root: Path) -> List[str]:
+    """스테이징+작업 트리 diff를 한 덩어리로 보여준다."""
+    combined = git_stdout_lines(root, ["diff", "HEAD", "--"], timeout=10.0)
+    untracked = untracked_file_preview_lines(root)
+    if combined:
+        return [*combined, *([] if not untracked else ["", *untracked])]
+
+    cached = git_stdout_lines(root, ["diff", "--cached", "--"], timeout=10.0)
+    working = git_stdout_lines(root, ["diff", "--"], timeout=10.0)
+    lines: List[str] = []
+    if cached:
+        lines.extend(["# staged", *cached])
+    if working:
+        if lines:
+            lines.append("")
+        lines.extend(["# working tree", *working])
+    if untracked:
+        if lines:
+            lines.append("")
+        lines.extend(untracked)
+    return lines or ["(diff 없음)"]
+
+
+def test_command_hint_lines() -> List[str]:
+    return [f"- {command}" for command in AI_CONTEXT_TEST_HINTS]
+
+
+def iter_text_preview_files(root: Path, max_files: int = 250) -> List[Path]:
+    """작은 텍스트 파일만 제한적으로 스캔한다."""
+    root = root.resolve()
+    files: List[Path] = []
+    for current, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in TREE_EXCLUDED_NAMES)
+        for filename in sorted(filenames):
+            if len(files) >= max_files:
+                return files
+            path = Path(current) / filename
+            try:
+                if path.is_symlink():
+                    continue
+                resolved = path.resolve()
+                if not path_is_under_root(resolved, root):
+                    continue
+                if resolved.stat().st_size > 200_000:
+                    continue
+            except OSError:
+                continue
+            suffix = resolved.suffix.lower()
+            if suffix and suffix not in TEXT_PREVIEW_SUFFIXES:
+                continue
+            files.append(resolved)
+    return files
+
+
+def scan_text_markers(root: Path, markers: List[str], max_matches: int = 20) -> List[str]:
+    matches: List[str] = []
+    lowered_markers = [marker.lower() for marker in markers]
+    for path in iter_text_preview_files(root):
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as file:
+                for line_number, line in enumerate(file, start=1):
+                    lowered = line.lower()
+                    if any(marker in lowered for marker in lowered_markers):
+                        try:
+                            relative = path.relative_to(root)
+                        except ValueError:
+                            relative = path
+                        snippet = line.strip()
+                        if len(snippet) > 140:
+                            snippet = snippet[:137] + "..."
+                        matches.append(f"{relative}:{line_number}: {snippet}")
+                        if len(matches) >= max_matches:
+                            return matches
+        except OSError:
+            continue
+    return matches
+
+
+def failure_trace_lines(root: Path) -> List[str]:
+    return scan_text_markers(root, list(FAILURE_TRACE_KEYWORDS), max_matches=20) or ["(최근 에러/실패 흔적 없음)"]
+
+
+def todo_scan_lines(root: Path) -> List[str]:
+    return scan_text_markers(root, ["TODO", "FIXME"], max_matches=20) or ["(TODO/FIXME 없음)"]
+
+
+def ai_session_summary_lines(session_store: Optional[AiSessionStore]) -> List[str]:
+    if session_store is None:
+        return ["(세션 저장소 없음)"]
+
+    sessions = session_store.load()
+    if not sessions:
+        return ["(저장된 AI 세션 없음)"]
+
+    lines = []
+    for session in sorted(sessions, key=lambda item: item.updated_at, reverse=True)[:5]:
+        exit_code = "-" if session.exit_code is None else str(session.exit_code)
+        title = shorten(session.title, 40)
+        lines.append(f"- {session.id} {session.tool} exit={exit_code} updated={session.updated_at} title={title}")
+    return lines
+
+
+def readme_section_lines(root: Path, max_lines: int, title: str = "README") -> List[str]:
     readme = find_readme(root)
-    if readme:
-        print()
-        print(f"=== README: {readme.name} (first 40 lines) ===")
-        for line in read_text_preview(readme, max_lines=40):
-            print(line)
+    if not readme:
+        return []
+    body = [f"{readme.name} (first {max_lines} lines)", *read_text_preview(readme, max_lines=max_lines)]
+    return section_lines(title, body)
 
-    print()
-    print("=== File Tree (depth 2, max 100 items) ===")
-    for line in file_tree_lines(root, max_depth=2, max_items=100):
-        print(line)
 
-    if is_git_repository():
-        print()
-        print("=== Git Summary ===")
-        print(f"Branch: {current_git_branch()}")
+def default_git_summary_lines(root: Path) -> List[str]:
+    body = [f"Branch: {current_git_branch(root)}"]
 
-        commits = recent_git_commits(limit=3)
-        print("Recent commits:")
-        if commits:
-            for commit in commits:
-                print(f"  {commit}")
+    commits = recent_git_commits(limit=3, root=root)
+    body.append("Recent commits:")
+    body.extend([f"  {commit}" for commit in commits] or ["  (none)"])
+
+    changes = changed_git_files(root)
+    body.append("Changed files:")
+    body.extend([f"  {change}" for change in changes] or ["  (none)"])
+    return section_lines("Git Summary", body)
+
+
+def build_default_context(root: Path, session_store: Optional[AiSessionStore]) -> List[str]:
+    _ = session_store
+    lines = section_lines("AI Context", [f"CWD: {root}", "Mode: default"])
+    lines.extend(readme_section_lines(root, max_lines=40))
+    lines.extend(section_lines("File Tree", file_tree_lines(root, max_depth=2, max_items=100)))
+    if is_git_repository(root):
+        lines.extend(default_git_summary_lines(root))
+    return lines
+
+
+def build_debug_context(root: Path, session_store: Optional[AiSessionStore]) -> List[str]:
+    _ = session_store
+    lines = section_lines("AI Context", [f"CWD: {root}", "Mode: debug"])
+    if is_git_repository(root):
+        changes = changed_git_files(root)
+        lines.extend(section_lines("Changed Files", changes or ["(변경 파일 없음)"]))
+        lines.extend(section_lines("Git Diff (working tree)", git_diff_lines(root, ["diff", "--"])))
+    lines.extend(section_lines("Recent Error/Failure Traces", failure_trace_lines(root)))
+    lines.extend(section_lines("Test Command Hints", test_command_hint_lines()))
+    return lines
+
+
+def build_review_context(root: Path, session_store: Optional[AiSessionStore]) -> List[str]:
+    _ = session_store
+    lines = section_lines("AI Context", [f"CWD: {root}", "Mode: review"])
+    if is_git_repository(root):
+        lines.extend(section_lines("Git Diff (staged + working tree)", review_diff_lines(root)))
+        commits = recent_git_commits(limit=5, root=root)
+        lines.extend(section_lines("Recent Commits", commits or ["(커밋 없음)"]))
+    lines.extend(
+        section_lines(
+            "Test Status/Commands",
+            ["Status: not run by ai context", *test_command_hint_lines()],
+        )
+    )
+    return lines
+
+
+def build_handoff_context(root: Path, session_store: Optional[AiSessionStore]) -> List[str]:
+    lines = section_lines("AI Context", [f"CWD: {root}", "Mode: handoff"])
+    lines.extend(readme_section_lines(root, max_lines=25, title="README Summary"))
+    lines.extend(section_lines("Directory Structure", file_tree_lines(root, max_depth=3, max_items=150)))
+    lines.extend(section_lines("Recent AI Sessions", ai_session_summary_lines(session_store)))
+    lines.extend(section_lines("TODO/FIXME Scan", todo_scan_lines(root)))
+    return lines
+
+
+def build_ai_context(
+    root: Path,
+    mode: str = "default",
+    max_lines: Optional[int] = None,
+    session_store: Optional[AiSessionStore] = None,
+) -> str:
+    """AI에 붙여넣기 좋은 plain-text context pack을 만든다."""
+    normalized_mode = mode.lower()
+    if normalized_mode not in AI_CONTEXT_MODES:
+        available = ", ".join(AI_CONTEXT_MODES)
+        raise ValueError(f"알 수 없는 context mode입니다: {mode}. 사용 가능: {available}")
+
+    root = root.resolve()
+    builders = {
+        "default": build_default_context,
+        "debug": build_debug_context,
+        "review": build_review_context,
+        "handoff": build_handoff_context,
+    }
+    lines = builders[normalized_mode](root, session_store)
+    limit = max_lines if max_lines is not None else AI_CONTEXT_DEFAULT_MAX_LINES[normalized_mode]
+    return "\n".join(limit_context_lines(lines, limit)).rstrip() + "\n"
+
+
+def parse_ai_context_options(args: List[str]) -> tuple[str, Optional[int]]:
+    mode = "default"
+    max_lines: Optional[int] = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--mode":
+            if index + 1 >= len(args):
+                raise ValueError("--mode에는 값이 필요합니다.")
+            mode = args[index + 1].lower()
+            index += 2
+            continue
+        if arg.startswith("--mode="):
+            mode = arg.split("=", 1)[1].lower()
+            index += 1
+            continue
+        if arg == "--max-lines":
+            if index + 1 >= len(args):
+                raise ValueError("--max-lines에는 숫자 값이 필요합니다.")
+            value = args[index + 1]
+            index += 2
+        elif arg.startswith("--max-lines="):
+            value = arg.split("=", 1)[1]
+            index += 1
         else:
-            print("  (none)")
+            raise ValueError(f"알 수 없는 ai context 옵션입니다: {arg}")
 
-        changes = changed_git_files()
-        print("Changed files:")
-        if changes:
-            for change in changes:
-                print(f"  {change}")
-        else:
-            print("  (none)")
+        try:
+            max_lines = int(value)
+        except ValueError as exc:
+            raise ValueError("--max-lines에는 정수를 입력하세요.") from exc
+        if max_lines < 1:
+            raise ValueError("--max-lines에는 1 이상의 정수를 입력하세요.")
+
+    if mode not in AI_CONTEXT_MODES:
+        available = ", ".join(AI_CONTEXT_MODES)
+        raise ValueError(f"알 수 없는 context mode입니다: {mode}. 사용 가능: {available}")
+    return mode, max_lines
+
+
+def print_ai_context(ctx: ShellContext, mode: str = "default", max_lines: Optional[int] = None) -> None:
+    refresh_project_context(ctx)
+    print(build_ai_context(Path.cwd(), mode=mode, max_lines=max_lines, session_store=ctx.session_store), end="")
 
 
 # -----------------------------------------------------------------------------
@@ -1405,7 +1728,14 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     if subcommand == "context":
-        print_ai_context()
+        try:
+            mode, max_lines = parse_ai_context_options(parsed_args[1:])
+        except ValueError as exc:
+            print_error(str(exc))
+            print(f"사용 가능 모드: {', '.join(AI_CONTEXT_MODES)}")
+            print("사용법: ai context [--mode debug|review|handoff] [--max-lines N]")
+            return
+        print_ai_context(ctx, mode=mode, max_lines=max_lines)
         return
 
     if subcommand == "sessions":

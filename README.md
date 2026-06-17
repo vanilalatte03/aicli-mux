@@ -45,7 +45,7 @@ python mysh.py
 | 명령 | 설명 |
 |------|------|
 | `ai doctor` | Python·Git·Codex·Claude 환경 점검 |
-| `ai context` | README·파일 트리·Git 요약을 붙여넣기용으로 출력 |
+| `ai context [--mode debug\|review\|handoff] [--max-lines N]` | 기본/디버그/리뷰/인수인계용 plain-text 컨텍스트 팩 출력 |
 | `ai sessions` | 저장된 AI 세션 목록 |
 | `ai show <id>` | 세션 상세 (tool, cwd, command, 시각, exit code) |
 | `ai start codex [--title T] [--profile P] [prompt...]` | 세션 기록 후 Codex 실행 |

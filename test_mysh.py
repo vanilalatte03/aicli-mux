@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -128,6 +130,114 @@ class InputCompletionTests(unittest.TestCase):
         self.assertIn("gs", candidates)
         self.assertIn("ai doctor", candidates)
         self.assertIn("ai start codex", candidates)
+
+
+class AiContextTests(unittest.TestCase):
+    def write_readme(self, root: Path, line_count: int = 3) -> None:
+        lines = ["# Demo", "", *[f"line {index}" for index in range(line_count)]]
+        (root / "README.md").write_text("\n".join(lines), encoding="utf-8")
+
+    @unittest.skipUnless(shutil.which("git"), "git executable is required")
+    def test_context_modes_return_text_in_git_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            self.write_readme(root)
+            (root / "mysh.py").write_text("print('hi')\n", encoding="utf-8")
+            store = mysh.AiSessionStore(root)
+
+            for mode in ("default", "debug", "review", "handoff"):
+                with self.subTest(mode=mode):
+                    output = mysh.build_ai_context(root, mode=mode, session_store=store)
+
+                    self.assertIn("## AI Context", output)
+                    self.assertIn(f"Mode: {mode}", output)
+
+    def test_context_max_lines_limits_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_readme(root, line_count=50)
+
+            output = mysh.build_ai_context(root, mode="default", max_lines=5)
+
+            self.assertLessEqual(len(output.splitlines()), 5)
+            self.assertIn("(생략됨:", output)
+
+    def test_context_in_non_git_directory_is_graceful(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_readme(root)
+
+            output = mysh.build_ai_context(root, mode="debug", max_lines=50)
+
+            self.assertIn("## AI Context", output)
+            self.assertIn("## Test Command Hints", output)
+            self.assertNotIn("## Git Diff", output)
+
+    @unittest.skipUnless(shutil.which("git"), "git executable is required")
+    def test_review_context_includes_untracked_file_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            self.write_readme(root)
+            untracked = root / "new_notes.txt"
+            untracked.write_text("new context\nsecond line\n", encoding="utf-8")
+
+            output = mysh.build_ai_context(root, mode="review", max_lines=80)
+
+            self.assertIn("# untracked files", output)
+            self.assertIn("?? new_notes.txt", output)
+            self.assertIn("new context", output)
+
+    @unittest.skipUnless(shutil.which("git") and hasattr(os, "symlink"), "git and symlink support are required")
+    def test_review_context_does_not_preview_untracked_symlink_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            self.write_readme(root)
+            outside = parent / "secret.txt"
+            outside.write_text("outside secret\n", encoding="utf-8")
+            link = root / "notes.txt"
+            try:
+                os.symlink(outside, link)
+            except OSError as exc:
+                self.skipTest(f"symlink creation is unavailable: {exc}")
+
+            output = mysh.build_ai_context(root, mode="review", max_lines=80)
+
+            self.assertIn("?? notes.txt", output)
+            self.assertNotIn("outside secret", output)
+            self.assertNotIn("--- notes.txt (untracked preview", output)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support is required")
+    def test_todo_scan_does_not_follow_symlink_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "repo"
+            root.mkdir()
+            outside = parent / "secret.txt"
+            outside.write_text("TODO outside secret\n", encoding="utf-8")
+            link = root / "todo.txt"
+            try:
+                os.symlink(outside, link)
+            except OSError as exc:
+                self.skipTest(f"symlink creation is unavailable: {exc}")
+
+            lines = mysh.todo_scan_lines(root)
+
+            self.assertEqual(["(TODO/FIXME 없음)"], lines)
+
+    def test_unknown_context_mode_lists_available_modes(self) -> None:
+        with self.assertRaises(ValueError) as raised:
+            mysh.parse_ai_context_options(["--mode", "unknown"])
+
+        message = str(raised.exception)
+        self.assertIn("사용 가능", message)
+        self.assertIn("debug", message)
+        self.assertIn("review", message)
+        self.assertIn("handoff", message)
 
 
 if __name__ == "__main__":
