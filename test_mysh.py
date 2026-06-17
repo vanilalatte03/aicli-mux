@@ -449,6 +449,228 @@ class InputCompletionTests(unittest.TestCase):
 
 
 class ExternalCommandSafetyTests(unittest.TestCase):
+    def test_policy_segment_split_handles_shell_operators(self) -> None:
+        self.assertEqual(["a", "rm -rf b"], mysh.split_command_segments("a && rm -rf b", posix=False))
+        self.assertEqual(["echo 'a && b'", "git status"], mysh.split_command_segments("echo 'a && b' | git status", posix=False))
+
+    def test_policy_decision_allow_ask_and_deny(self) -> None:
+        rules = [
+            {"match": r"^safe\b", "action": "allow", "reason": "safe command"},
+            {"match": r"^maybe\b", "action": "ask", "reason": "needs confirmation"},
+            {"match": r"^never\b", "action": "deny", "reason": "blocked"},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual("allow", mysh.evaluate_command_policy("safe run", rules, root).action)
+
+            ask = mysh.evaluate_command_policy("maybe run", rules, root)
+            self.assertEqual("ask", ask.action)
+            self.assertEqual("needs confirmation", ask.reason)
+
+            deny = mysh.evaluate_command_policy("safe run && never run", rules, root)
+            self.assertEqual("deny", deny.action)
+            self.assertEqual("blocked", deny.reason)
+
+    def test_policy_deny_wins_over_earlier_ask_for_same_segment(self) -> None:
+        rules = [
+            {"match": r"drop", "action": "ask", "reason": "broad ask"},
+            {"match": r"drop\s+table", "action": "deny", "reason": "drop table blocked"},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            decision = mysh.evaluate_command_policy("drop table users", rules, Path(tmp))
+
+        self.assertEqual("deny", decision.action)
+        self.assertEqual("drop table blocked", decision.reason)
+
+    def test_invalid_policy_regex_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = mysh.CommandPolicyStore(root)
+            store.save([{"match": "(", "action": "deny", "reason": "typo"}])
+
+            decision = mysh.evaluate_command_policy("echo hello", store.load(), root)
+
+        self.assertEqual("deny", decision.action)
+        self.assertIn("invalid policy regex", decision.reason)
+
+    def test_malformed_policy_rule_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = mysh.CommandPolicyStore(root)
+            store.save(
+                [
+                    {"match": r"^safe\b", "action": "allow", "reason": "safe"},
+                    {"match": r"rm\s+-rf", "action": "typo", "reason": "bad action"},
+                ]
+            )
+
+            decision = mysh.evaluate_command_policy("safe command", store.load(), root)
+
+        self.assertEqual("deny", decision.action)
+        self.assertEqual("invalid policy rule", decision.reason)
+
+    def test_malformed_policy_match_type_and_container_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = mysh.CommandPolicyStore(root)
+            store.save(
+                [
+                    {"match": r"^safe\b", "action": "allow", "reason": "safe"},
+                    {"match": [r"rm\s+-rf"], "action": "deny", "reason": "bad match"},
+                ]
+            )
+            typed_decision = mysh.evaluate_command_policy("safe command", store.load(), root)
+
+            store.path.write_text(json.dumps({"rules": {"match": r"^safe\b", "action": "allow"}}), encoding="utf-8")
+            container_decision = mysh.evaluate_command_policy("safe command", store.load(), root)
+
+        self.assertEqual("deny", typed_decision.action)
+        self.assertEqual("invalid policy rule", typed_decision.reason)
+        self.assertEqual("deny", container_decision.action)
+        self.assertEqual("invalid policy rule", container_decision.reason)
+
+    def test_policy_detects_outside_workspace_absolute_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            inside = root / "out.txt"
+            outside = root.parent / "outside-policy-test.txt"
+
+            inside_decision = mysh.evaluate_command_policy(f"echo hello > {inside}", [], root)
+            outside_decision = mysh.evaluate_command_policy(f"echo hello > {outside}", [], root)
+
+        self.assertEqual("allow", inside_decision.action)
+        self.assertEqual("ask", outside_decision.action)
+        self.assertIn("workspace outside", outside_decision.reason)
+
+    def test_policy_outside_workspace_write_avoids_url_and_source_false_positives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source = root.parent / "source.txt"
+            target = root / "dest.txt"
+            outside_value = root.parent / "secret.txt"
+
+            url_decision = mysh.evaluate_command_policy("curl https://example.com/file > out.txt", [], root)
+            copy_decision = mysh.evaluate_command_policy(f"cp {source} {target}", [], root)
+            value_decision = mysh.evaluate_command_policy(
+                f"Set-Content -Path {target} -Value {outside_value}",
+                [],
+                root,
+            )
+
+        self.assertEqual("allow", url_decision.action)
+        self.assertEqual("allow", copy_decision.action)
+        self.assertEqual("allow", value_decision.action)
+
+    def test_policy_outside_workspace_write_detects_powershell_path_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            outside = root.parent / "outside-policy-test.txt"
+
+            decision = mysh.evaluate_command_policy(f"Set-Content -Path {outside} -Value ok", [], root)
+            colon_path_decision = mysh.evaluate_command_policy(
+                f"Set-Content -Path:{outside} -Value ok",
+                [],
+                root,
+            )
+            colon_literal_decision = mysh.evaluate_command_policy(
+                f"Set-Content -LiteralPath:{outside} -Value ok",
+                [],
+                root,
+            )
+            colon_file_decision = mysh.evaluate_command_policy(
+                f"Out-File -FilePath:{outside} -InputObject ok",
+                [],
+                root,
+            )
+            out_file_encoding_decision = mysh.evaluate_command_policy(
+                f"Out-File -Encoding utf8 {outside}",
+                [],
+                root,
+            )
+            set_content_encoding_decision = mysh.evaluate_command_policy(
+                f"Set-Content -Encoding utf8 {outside} -Value ok",
+                [],
+                root,
+            )
+            new_item_type_decision = mysh.evaluate_command_policy(
+                f"New-Item -ItemType File {outside}",
+                [],
+                root,
+            )
+            tee_colon_file_decision = mysh.evaluate_command_policy(
+                f"tee -FilePath:{outside}",
+                [],
+                root,
+            )
+            tee_object_file_decision = mysh.evaluate_command_policy(
+                f"Tee-Object -FilePath {outside}",
+                [],
+                root,
+            )
+            tee_operand_decision = mysh.evaluate_command_policy(
+                f"tee {outside}",
+                [],
+                root,
+            )
+            copy_decision = mysh.evaluate_command_policy(
+                f"Copy-Item -Path {root / 'in.txt'} -Destination {outside}",
+                [],
+                root,
+            )
+            colon_destination_decision = mysh.evaluate_command_policy(
+                f"Copy-Item -Path {root / 'in.txt'} -Destination:{outside}",
+                [],
+                root,
+            )
+            copy_with_log_decision = mysh.evaluate_command_policy(
+                f"Copy-Item -Path {root / 'in.txt'} -Destination {outside} > {root / 'copy.log'}",
+                [],
+                root,
+            )
+            second_redirect_decision = mysh.evaluate_command_policy(
+                f"Copy-Item -Path {root / 'in.txt'} -Destination {root / 'out.txt'} > {root / 'copy.log'} 2> {outside}",
+                [],
+                root,
+            )
+            move_decision = mysh.evaluate_command_policy(
+                f"Move-Item -Path {root / 'in.txt'} -Destination {outside}",
+                [],
+                root,
+            )
+
+        self.assertEqual("ask", decision.action)
+        self.assertIn("workspace outside", decision.reason)
+        self.assertEqual("ask", colon_path_decision.action)
+        self.assertIn("workspace outside", colon_path_decision.reason)
+        self.assertEqual("ask", colon_literal_decision.action)
+        self.assertIn("workspace outside", colon_literal_decision.reason)
+        self.assertEqual("ask", colon_file_decision.action)
+        self.assertIn("workspace outside", colon_file_decision.reason)
+        self.assertEqual("ask", out_file_encoding_decision.action)
+        self.assertIn("workspace outside", out_file_encoding_decision.reason)
+        self.assertEqual("ask", set_content_encoding_decision.action)
+        self.assertIn("workspace outside", set_content_encoding_decision.reason)
+        self.assertEqual("ask", new_item_type_decision.action)
+        self.assertIn("workspace outside", new_item_type_decision.reason)
+        self.assertEqual("ask", tee_colon_file_decision.action)
+        self.assertIn("workspace outside", tee_colon_file_decision.reason)
+        self.assertEqual("ask", tee_object_file_decision.action)
+        self.assertIn("workspace outside", tee_object_file_decision.reason)
+        self.assertEqual("ask", tee_operand_decision.action)
+        self.assertIn("workspace outside", tee_operand_decision.reason)
+        self.assertEqual("ask", copy_decision.action)
+        self.assertIn("workspace outside", copy_decision.reason)
+        self.assertEqual("ask", colon_destination_decision.action)
+        self.assertIn("workspace outside", colon_destination_decision.reason)
+        self.assertEqual("ask", copy_with_log_decision.action)
+        self.assertIn("workspace outside", copy_with_log_decision.reason)
+        self.assertEqual("ask", second_redirect_decision.action)
+        self.assertIn("workspace outside", second_redirect_decision.reason)
+        self.assertEqual("ask", move_decision.action)
+        self.assertIn("workspace outside", move_decision.reason)
+
     def test_dangerous_command_patterns_are_detected(self) -> None:
         dangerous = [
             "rm -rf build",
@@ -496,16 +718,77 @@ class ExternalCommandSafetyTests(unittest.TestCase):
 
         run_mock.assert_called_once_with("rm -rf build", bypass_safety=True)
 
+    def test_policy_bypass_skips_ask_but_not_deny(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rules = [{"match": r"rm\s+-rf", "action": "ask", "reason": "remove recursively"}]
+            mysh.CommandPolicyStore(root).save(rules)
+            old_cwd = Path.cwd()
+            os.chdir(root)
+            try:
+                with mock.patch("mysh.detect_project_root", return_value=root), mock.patch(
+                    "mysh.subprocess.run"
+                ) as run_mock:
+                    run_mock.return_value.returncode = 0
+                    mysh.run_external_command("rm -rf build", bypass_safety=True)
+                run_mock.assert_called_once()
+
+                mysh.CommandPolicyStore(root).save(
+                    [{"match": r"rm\s+-rf", "action": "deny", "reason": "blocked"}]
+                )
+                output = StringIO()
+                with mock.patch("mysh.detect_project_root", return_value=root), mock.patch(
+                    "mysh.subprocess.run"
+                ) as run_mock, redirect_stdout(output):
+                    mysh.run_external_command("rm -rf build", bypass_safety=True)
+                run_mock.assert_not_called()
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertIn("차단", output.getvalue())
+
     def test_noninteractive_dangerous_command_is_blocked(self) -> None:
         output = StringIO()
 
-        with mock.patch("mysh.is_interactive_stdin", return_value=False), mock.patch(
-            "mysh.subprocess.run"
-        ) as run_mock, redirect_stdout(output):
+        with mock.patch("mysh.detect_project_root", return_value=Path.cwd()), mock.patch(
+            "mysh.is_interactive_stdin", return_value=False
+        ), mock.patch("mysh.subprocess.run") as run_mock, redirect_stdout(output):
             mysh.run_external_command("rm -rf build")
 
         run_mock.assert_not_called()
         self.assertIn("차단", output.getvalue())
+
+    def test_noninteractive_ask_and_deny_are_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mysh.CommandPolicyStore(root).save(
+                [
+                    {"match": r"^ask-me\b", "action": "ask", "reason": "confirm"},
+                    {"match": r"^deny-me\b", "action": "deny", "reason": "blocked"},
+                ]
+            )
+            old_cwd = Path.cwd()
+            os.chdir(root)
+            try:
+                with mock.patch("mysh.detect_project_root", return_value=root), mock.patch(
+                    "mysh.is_interactive_stdin", return_value=False
+                ), mock.patch("mysh.subprocess.run") as run_mock:
+                    mysh.run_external_command("ask-me")
+                    mysh.run_external_command("deny-me")
+                run_mock.assert_not_called()
+            finally:
+                os.chdir(old_cwd)
+
+    def test_policy_store_corrupt_json_falls_back_to_defaults_and_backs_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = mysh.CommandPolicyStore(Path(tmp))
+            store.ensure_store_dir()
+            store.path.write_text("{not json", encoding="utf-8")
+
+            rules = store.load()
+
+            self.assertEqual(mysh.default_policy_rules(), rules)
+            self.assertTrue(store.backup_path.exists())
 
 
 class AiSessionCommandTests(unittest.TestCase):
