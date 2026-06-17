@@ -114,5 +114,21 @@ class AiCommandBuilderTests(unittest.TestCase):
         self.assertNotIn("hello", summary)
 
 
+class InputCompletionTests(unittest.TestCase):
+    def test_normalize_input_line_removes_leading_bom(self) -> None:
+        self.assertEqual("ai doctor", mysh.normalize_input_line("\ufeffai doctor\n"))
+
+    def test_completion_candidates_include_commands_aliases_and_ai_subcommands(self) -> None:
+        ctx = mysh.ShellContext()
+        ctx.aliases["gs"] = "git status"
+
+        candidates = mysh.command_completion_candidates(ctx)
+
+        self.assertIn("help", candidates)
+        self.assertIn("gs", candidates)
+        self.assertIn("ai doctor", candidates)
+        self.assertIn("ai start codex", candidates)
+
+
 if __name__ == "__main__":
     unittest.main()
