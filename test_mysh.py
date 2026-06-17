@@ -126,6 +126,40 @@ class AiCommandBuilderTests(unittest.TestCase):
 
         self.assertEqual(["--model", "gpt-5"], args)
 
+    def test_rerunnable_args_drop_resume_and_continue_flags(self) -> None:
+        args = mysh.extract_rerunnable_ai_args(
+            "claude",
+            ["--continue", "--resume", "old-session", "-r", "another-session", "--model", "sonnet", "prompt"],
+        )
+
+        self.assertEqual(["--model", "sonnet"], args)
+
+    def test_rerunnable_args_drop_dangerous_value_options(self) -> None:
+        args = mysh.extract_rerunnable_ai_args(
+            "codex",
+            [
+                "-c",
+                "approval_policy=never",
+                "-c",
+                'model="gpt-5"',
+                "--sandbox",
+                "danger-full-access",
+                "--model",
+                "gpt-5",
+                "prompt",
+            ],
+        )
+
+        self.assertEqual(["-c", 'model="gpt-5"', "--model", "gpt-5"], args)
+
+    def test_rerunnable_args_drop_claude_permission_bypass_value(self) -> None:
+        args = mysh.extract_rerunnable_ai_args(
+            "claude",
+            ["--permission-mode", "bypassPermissions", "--model", "sonnet", "prompt"],
+        )
+
+        self.assertEqual(["--model", "sonnet"], args)
+
 
 class InputCompletionTests(unittest.TestCase):
     def test_normalize_input_line_removes_leading_bom(self) -> None:

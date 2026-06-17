@@ -1356,10 +1356,21 @@ LONG_FLAGS_WITH_VALUE = {
 CODEX_SHORT_FLAGS_WITH_VALUE = {"-C", "-a", "-c", "-i", "-m", "-p", "-s"}
 CLAUDE_SHORT_FLAGS_WITH_VALUE = {"-d", "-m", "-n", "-r", "-w"}
 AI_RERUN_EXCLUDED_FLAGS = {
+    "--continue",
     "--dangerously-bypass-approvals-and-sandbox",
     "--dangerously-bypass-hook-trust",
     "--dangerously-skip-permissions",
+    "--resume",
 }
+AI_RERUN_EXCLUDED_SHORT_FLAGS_WITH_VALUE = {"-r"}
+AI_RERUN_DANGEROUS_VALUES = {
+    "--approval-policy": {"never"},
+    "--ask-for-approval": {"never"},
+    "--permission-mode": {"bypasspermissions", "bypass-permissions"},
+    "--sandbox": {"danger-full-access"},
+    "-s": {"danger-full-access"},
+}
+AI_RERUN_CONFIG_FLAGS = {"--config", "-c"}
 
 
 def has_codex_cd_arg(args: List[str]) -> bool:
@@ -1456,6 +1467,34 @@ def short_flags_with_value(tool: str) -> set[str]:
     return set()
 
 
+def normalized_option_value(value: str) -> str:
+    return value.strip().strip("\"'").lower()
+
+
+def is_dangerous_rerun_option(name: str, value: str) -> bool:
+    normalized = normalized_option_value(value)
+    dangerous_values = AI_RERUN_DANGEROUS_VALUES.get(name)
+    if dangerous_values and normalized in dangerous_values:
+        return True
+
+    if name in AI_RERUN_CONFIG_FLAGS:
+        compact = normalized.replace(" ", "").replace("_", "-")
+        return any(
+            pattern in compact
+            for pattern in (
+                "approval-policy=never",
+                "ask-for-approval=never",
+                "sandbox-mode=danger-full-access",
+                "sandbox=danger-full-access",
+                "sandbox-permissions=danger-full-access",
+                "permission-mode=bypasspermissions",
+                "permission-mode=bypass-permissions",
+            )
+        )
+
+    return False
+
+
 def extract_rerunnable_ai_args(tool: str, args: List[str]) -> List[str]:
     """프롬프트 본문 없이 재실행 가능한 옵션/플래그만 보존한다."""
     rerunnable: List[str] = []
@@ -1470,13 +1509,22 @@ def extract_rerunnable_ai_args(tool: str, args: List[str]) -> List[str]:
         if arg.startswith("--") and arg != "--":
             name, separator, _value = arg.partition("=")
             if name in AI_RERUN_EXCLUDED_FLAGS:
+                if not separator and index + 1 < len(args) and not args[index + 1].startswith("-"):
+                    index += 2
+                    continue
                 index += 1
                 continue
             if separator:
+                if is_dangerous_rerun_option(name, _value):
+                    index += 1
+                    continue
                 rerunnable.append(arg)
                 index += 1
                 continue
             if name in LONG_FLAGS_WITH_VALUE and index + 1 < len(args):
+                if is_dangerous_rerun_option(name, args[index + 1]):
+                    index += 2
+                    continue
                 rerunnable.extend([arg, args[index + 1]])
                 index += 2
                 continue
@@ -1485,7 +1533,13 @@ def extract_rerunnable_ai_args(tool: str, args: List[str]) -> List[str]:
             continue
 
         if arg.startswith("-") and arg != "-":
+            if arg in AI_RERUN_EXCLUDED_SHORT_FLAGS_WITH_VALUE:
+                index += 2 if index + 1 < len(args) else 1
+                continue
             if arg in value_short_flags and index + 1 < len(args):
+                if is_dangerous_rerun_option(arg, args[index + 1]):
+                    index += 2
+                    continue
                 rerunnable.extend([arg, args[index + 1]])
                 index += 2
                 continue
