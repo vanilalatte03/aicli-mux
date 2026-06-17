@@ -1,58 +1,62 @@
 # mysh
 
-`mysh.py`는 Python 3.8+ 표준 라이브러리만 사용하는 단일 파일 미니 커스텀 셸입니다.
+Codex / Claude Code 작업에 특화된 단일 파일 미니 셸. Python 3.8+ 표준 라이브러리만으로 바로 실행되며, 원하면 `rich`·`prompt_toolkit`으로 업그레이드할 수 있습니다.
 
-## 실행
+## 빠른 시작
 
-### 기본 실행(의존성 0)
-
-외부 패키지 설치 없이 바로 실행할 수 있습니다. 이 경로에서는 Python 표준 라이브러리만 사용하며, 기존 `input()`/`readline` 기반 입력과 plain 텍스트 출력으로 동작합니다.
-
-```powershell
+```bash
 python mysh.py
 ```
 
-Windows에서는 시작 시 콘솔 코드 페이지와 Python 표준 입출력을 UTF-8로 맞춰 한글과 이모지가 깨질 가능성을 줄입니다.
+설치 없이 바로 실행됩니다. `help`로 명령어 목록을, `exit`로 종료합니다.
 
-### 향상된 실행(선택 의존성)
+## 향상된 모드 (선택)
 
-Rich 테이블/패널 출력과 prompt_toolkit 입력 루프를 쓰려면 선택 의존성을 설치합니다.
-
-```powershell
+```bash
 python -m pip install -r requirements.txt
 python mysh.py
 ```
 
-`rich`가 있으면 `ai doctor`, `ai sessions`, `ai show`가 Rich 테이블·패널로 출력됩니다. `prompt_toolkit`이 있으면 영속 히스토리, 명령어/별칭/`ai` 하위 명령 자동완성, 멀티라인 입력을 사용합니다. 일반 Enter는 실행이고, `Esc+Enter`는 줄바꿈입니다. 둘 중 하나가 없거나 둘 다 없어도 셸은 기본 실행 경로로 자동 fallback합니다.
+- `rich` → `ai doctor`·`ai sessions`·`ai show`가 표/패널로 출력
+- `prompt_toolkit` → 영속 히스토리, 자동완성, 멀티라인 입력 (Enter 실행 / Esc+Enter 줄바꿈)
+
+패키지가 없으면 자동으로 기본 모드로 동작합니다.
 
 ## 명령어
 
-- `help` - 등록된 명령어와 설명 출력
-- `cd <경로>` - 디렉터리 이동, 인자가 없으면 홈으로 이동
-- `pwd` - 현재 경로 출력
-- `ls` - 현재 폴더 목록 출력, 폴더는 `/`로 표시
-- `echo <텍스트>` - 입력한 텍스트 출력
-- `history` - 이번 세션 명령어 기록 출력
-- `clear` - 화면 지우기
-- `theme <green|blue|magenta|mono>` - 프롬프트 색상 변경
-- `alias 이름=명령` - 별칭 추가
-- `unalias <이름>` - 별칭 삭제
-- `ai doctor` - Python, Git, Codex, Claude 상태 확인
-- `ai context` - 현재 프로젝트의 README, 파일 트리, Git 요약 출력
-- `ai sessions` - `.mysh/sessions.json`에 저장된 AI 세션 목록 출력
-- `ai show <session-id>` - 저장된 AI 세션 상세 정보 출력
-- `ai start codex [--title T] [--profile P] [prompt...]` - 세션을 기록하고 Codex 실행
-- `ai start claude [--title T] [--profile P] [prompt...]` - 세션을 기록하고 Claude 실행
-- `codex ...`, `claude ...` - 세션을 먼저 기록한 뒤 실제 CLI에 위임
-- `exit`, `quit` - 셸 종료
+### 기본
 
-등록되지 않은 명령어는 실제 OS 셸 명령으로 실행을 시도합니다.
+| 명령 | 설명 |
+|------|------|
+| `help` | 명령어 목록 |
+| `cd [경로]` | 디렉터리 이동 (없으면 홈) |
+| `pwd` | 현재 경로 |
+| `ls` | 폴더 목록 (폴더는 `/` 표시) |
+| `echo <텍스트>` | 텍스트 출력 |
+| `history` | 이번 세션 입력 기록 |
+| `clear` | 화면 지우기 |
+| `theme <green\|blue\|magenta\|mono>` | 프롬프트 색상 변경 |
+| `alias 이름=명령` / `unalias 이름` | 별칭 추가 / 삭제 |
+| `!<명령>` | 내장/별칭 우회하고 OS 셸에 직접 전달 |
+| `exit` / `quit` | 종료 |
 
-AI 세션 기록은 프로젝트 루트의 `.mysh/sessions.json`에 저장됩니다. 프롬프트 본문은 저장하지 않고 유무와 길이만 기록합니다.
+### AI
+
+| 명령 | 설명 |
+|------|------|
+| `ai doctor` | Python·Git·Codex·Claude 환경 점검 |
+| `ai context` | README·파일 트리·Git 요약을 붙여넣기용으로 출력 |
+| `ai sessions` | 저장된 AI 세션 목록 |
+| `ai show <id>` | 세션 상세 (tool, cwd, command, 시각, exit code) |
+| `ai start codex [--title T] [--profile P] [prompt...]` | 세션 기록 후 Codex 실행 |
+| `ai start claude [--title T] [--profile P] [prompt...]` | 세션 기록 후 Claude 실행 |
+| `codex ...` / `claude ...` | 세션을 먼저 기록한 뒤 실제 CLI에 위임 |
+
+등록되지 않은 명령은 OS 셸 명령으로 실행을 시도합니다. AI 세션은 프로젝트 루트의 `.mysh/sessions.json`에 저장되며, **프롬프트 본문은 저장하지 않고** 유무·길이만 기록합니다.
 
 ## 새 명령어 추가
 
-`mysh.py`의 내장 명령어 섹션에서 아래처럼 함수 하나를 추가하면 됩니다.
+`mysh.py`의 내장 명령어 섹션에 함수 하나만 추가하면 됩니다.
 
 ```python
 @command("hello", "인사를 출력합니다.")
