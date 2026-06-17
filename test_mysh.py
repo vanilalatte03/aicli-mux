@@ -67,6 +67,61 @@ class AiSessionStoreTests(unittest.TestCase):
             self.assertIn(".mysh/", gitignore.splitlines())
 
 
+class ShellConfigStoreTests(unittest.TestCase):
+    def test_config_save_and_load_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = mysh.ShellContext(project_root=root)
+            ctx.theme = "blue"
+            ctx.aliases = {"gs": "git status"}
+            ctx.active_profile = "work"
+            ctx.default_ai_tool = "claude"
+            ctx.save_config()
+
+            loaded = mysh.ShellContext(project_root=root)
+
+            self.assertEqual("blue", loaded.theme)
+            self.assertEqual({"gs": "git status"}, loaded.aliases)
+            self.assertEqual("work", loaded.active_profile)
+            self.assertEqual("claude", loaded.default_ai_tool)
+
+    def test_corrupt_config_json_is_backed_up_and_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store_dir = root / ".mysh"
+            store_dir.mkdir()
+            config_path = store_dir / "config.json"
+            config_path.write_text("{broken json", encoding="utf-8")
+
+            ctx = mysh.ShellContext(project_root=root)
+
+            self.assertEqual("green", ctx.theme)
+            self.assertEqual(mysh.default_aliases(), ctx.aliases)
+            self.assertTrue((store_dir / "config.json.bak").exists())
+            with config_path.open("r", encoding="utf-8") as file:
+                self.assertEqual(mysh.default_shell_config(), json.load(file))
+
+    def test_ai_config_reset_restores_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = mysh.ShellContext(project_root=root)
+            ctx.theme = "magenta"
+            ctx.aliases = {"gs": "git status"}
+            ctx.active_profile = "work"
+            ctx.default_ai_tool = "claude"
+            ctx.save_config()
+
+            output = StringIO()
+            with redirect_stdout(output):
+                mysh.cmd_ai(ctx, [], "config reset")
+
+            self.assertIn("초기화", output.getvalue())
+            self.assertEqual("green", ctx.theme)
+            self.assertEqual(mysh.default_aliases(), ctx.aliases)
+            self.assertIsNone(ctx.active_profile)
+            self.assertEqual("codex", ctx.default_ai_tool)
+
+
 class AiCommandBuilderTests(unittest.TestCase):
     def test_codex_command_adds_default_cd(self) -> None:
         cwd = Path("C:/WorkSpace/custom-tm")
