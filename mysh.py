@@ -2496,6 +2496,11 @@ AI_RERUN_DANGEROUS_VALUES = {
     "-s": {"danger-full-access"},
 }
 AI_RERUN_CONFIG_FLAGS = {"--config", "-c"}
+AI_RERUNNABLE_SUBCOMMANDS = {
+    "codex": {"exec"},
+    "claude": set(),
+}
+AI_TOOLS_WITH_PROFILE_FLAG = {"codex"}
 
 
 def has_codex_cd_arg(args: List[str]) -> bool:
@@ -2584,6 +2589,15 @@ def extract_long_option_value(args: List[str], name: str) -> Optional[str]:
     return None
 
 
+def with_default_ai_profile(tool: str, args: List[str], profile: Optional[str]) -> List[str]:
+    """활성 profile이 있으면 실제 도구 인자에도 기본값으로 주입한다."""
+    if tool not in AI_TOOLS_WITH_PROFILE_FLAG:
+        return list(args)
+    if not profile or extract_long_option_value(args, "--profile") is not None:
+        return list(args)
+    return ["--profile", profile, *args]
+
+
 def short_flags_with_value(tool: str) -> set[str]:
     if tool == "codex":
         return CODEX_SHORT_FLAGS_WITH_VALUE
@@ -2620,10 +2634,15 @@ def is_dangerous_rerun_option(name: str, value: str) -> bool:
     return False
 
 
+def is_rerunnable_ai_subcommand(tool: str, arg: str) -> bool:
+    return arg in AI_RERUNNABLE_SUBCOMMANDS.get(tool, set())
+
+
 def extract_rerunnable_ai_args(tool: str, args: List[str]) -> List[str]:
     """프롬프트 본문 없이 재실행 가능한 옵션/플래그만 보존한다."""
     rerunnable: List[str] = []
     value_short_flags = short_flags_with_value(tool)
+    subcommand_seen = False
     index = 0
 
     while index < len(args):
@@ -2672,6 +2691,12 @@ def extract_rerunnable_ai_args(tool: str, args: List[str]) -> List[str]:
             index += 1
             continue
 
+        if not subcommand_seen and is_rerunnable_ai_subcommand(tool, arg):
+            rerunnable.append(arg)
+            subcommand_seen = True
+            index += 1
+            continue
+
         break
 
     return rerunnable
@@ -2682,6 +2707,7 @@ def summarize_ai_command(tool: str, args: List[str]) -> str:
     parts = [tool]
     prompt_tokens: List[str] = []
     value_short_flags = short_flags_with_value(tool)
+    subcommand_seen = False
     index = 0
 
     while index < len(args):
@@ -2710,6 +2736,12 @@ def summarize_ai_command(tool: str, args: List[str]) -> str:
                 index += 2
                 continue
             parts.append(arg)
+            index += 1
+            continue
+
+        if not prompt_tokens and not subcommand_seen and is_rerunnable_ai_subcommand(tool, arg):
+            parts.append(arg)
+            subcommand_seen = True
             index += 1
             continue
 
@@ -2806,8 +2838,9 @@ def run_ai_tool_session(
         ctx.active_profile = explicit_profile
         ctx.save_config()
 
-    command_args = build_ai_command(tool, user_args, cwd)
-    session = create_ai_session(tool, cwd, command_args, title, session_profile, user_args=user_args)
+    effective_user_args = with_default_ai_profile(tool, user_args, session_profile)
+    command_args = build_ai_command(tool, effective_user_args, cwd)
+    session = create_ai_session(tool, cwd, command_args, title, session_profile, user_args=effective_user_args)
     ctx.session_store.add(session)
     ctx.task_store.add_session_to_current(session.id)
     process_args = [resolve_executable_for_subprocess(command_args[0]), *command_args[1:]]
@@ -3286,7 +3319,7 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     if not parsed_args:
-        print("사용법: ai doctor | ai context | ai policy | ai task | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
+        print("사용법: ai doctor | ai context | ai policy | ai task | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start [codex|claude] [옵션] [prompt...]")
         return
 
     subcommand = parsed_args[0].lower()
@@ -3381,19 +3414,20 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     if subcommand == "start":
-        if len(parsed_args) < 2:
-            print_error("실행할 AI 도구를 입력하세요.")
-            print("사용법: ai start <codex|claude> [--title T] [--profile P] [prompt...]")
-            return
-
-        tool = parsed_args[1].lower()
+        start_args = parsed_args[1:]
+        if not start_args or start_args[0].startswith("-"):
+            tool = ctx.default_ai_tool
+            tool_args = start_args
+        else:
+            tool = start_args[0].lower()
+            tool_args = start_args[1:]
         if tool not in {"codex", "claude"}:
             print_error(f"지원하지 않는 AI 도구입니다: {tool}")
             print("사용 가능: codex, claude")
             return
 
         try:
-            title, profile, passthrough_args = parse_ai_start_options(parsed_args[2:])
+            title, profile, passthrough_args = parse_ai_start_options(tool_args)
         except ValueError as exc:
             print_error(str(exc))
             return
@@ -3401,7 +3435,7 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     print_error(f"알 수 없는 ai 하위 명령입니다: {subcommand}")
-    print("사용법: ai doctor | ai context | ai policy | ai task | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start <codex|claude> [옵션] [prompt...]")
+    print("사용법: ai doctor | ai context | ai policy | ai task | ai sessions [--tool codex|claude] [--failed] | ai show <session-id> [--json] | ai rerun <session-id> | ai start [codex|claude] [옵션] [prompt...]")
 
 
 @command("codex", "Codex CLI를 세션으로 기록한 뒤 실행합니다.")
