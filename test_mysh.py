@@ -67,6 +67,194 @@ class AiSessionStoreTests(unittest.TestCase):
             self.assertIn(".mysh/", gitignore.splitlines())
 
 
+class AiTaskStoreTests(unittest.TestCase):
+    def test_task_command_roundtrip_new_show_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = mysh.ShellContext(project_root=root)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(root)
+                with mock.patch("mysh.refresh_project_context", lambda _ctx: None):
+                    output = StringIO()
+                    with redirect_stdout(output):
+                        mysh.cmd_ai(ctx, [], 'task new "write retry docs"')
+
+                    tasks, current_task_id = ctx.task_store.load_state()
+                    self.assertEqual(1, len(tasks))
+                    task = tasks[0]
+                    self.assertEqual(task.id, current_task_id)
+                    self.assertEqual("write retry docs", task.goal)
+                    self.assertEqual("active", task.status)
+
+                    show_output = StringIO()
+                    with redirect_stdout(show_output):
+                        mysh.cmd_ai(ctx, [], f"task show {task.id}")
+                    self.assertIn("write retry docs", show_output.getvalue())
+
+                    done_output = StringIO()
+                    with redirect_stdout(done_output):
+                        mysh.cmd_ai(ctx, [], f'task done {task.id} --next "open PR"')
+            finally:
+                os.chdir(original_cwd)
+
+            done = ctx.task_store.get(task.id)
+            self.assertIsNotNone(done)
+            assert done is not None
+            self.assertEqual("done", done.status)
+            self.assertEqual("open PR", done.next_action)
+            self.assertIsNone(ctx.task_store.current())
+
+    def test_active_task_links_new_ai_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = mysh.ShellContext(project_root=root)
+            task = mysh.AiTask(
+                id="task123",
+                goal="run codex",
+                cwd=str(root),
+                status="active",
+                created_at="2026-06-17T10:00:00+09:00",
+                updated_at="2026-06-17T10:00:00+09:00",
+            )
+            ctx.task_store.add(task)
+            completed = subprocess.CompletedProcess(["codex"], 0)
+
+            with mock.patch("mysh.refresh_project_context", lambda _ctx: None), mock.patch(
+                "mysh.resolve_executable_for_subprocess", return_value="codex"
+            ), mock.patch("mysh.subprocess.run", return_value=completed):
+                exit_code = mysh.run_ai_tool_session(ctx, "codex", ["--model", "gpt-5"], cwd_override=root)
+
+            self.assertEqual(0, exit_code)
+            sessions = ctx.session_store.load()
+            linked = ctx.task_store.get("task123")
+            self.assertIsNotNone(linked)
+            assert linked is not None
+            self.assertEqual([sessions[-1].id], linked.session_ids)
+
+    @unittest.skipUnless(shutil.which("git"), "git executable is required")
+    def test_changed_files_are_captured_against_git_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True)
+            tracked = root / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+
+            task = mysh.create_ai_task(root, "change files")
+            tracked.write_text("changed\n", encoding="utf-8")
+            (root / "new.txt").write_text("new\n", encoding="utf-8")
+
+            changed = mysh.changed_git_files_since_baseline(root, task.git_baseline)
+
+            self.assertIsNotNone(changed)
+            assert changed is not None
+            self.assertTrue(any("tracked.txt" in line for line in changed))
+            self.assertTrue(any("new.txt" in line for line in changed))
+
+    @unittest.skipUnless(shutil.which("git"), "git executable is required")
+    def test_changed_files_do_not_readd_preexisting_dirty_tracked_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True)
+            tracked = root / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+            tracked.write_text("dirty before task\n", encoding="utf-8")
+
+            task = mysh.create_ai_task(root, "start from dirty tree")
+            (root / "new.txt").write_text("new after task\n", encoding="utf-8")
+
+            changed = mysh.changed_git_files_since_baseline(root, task.git_baseline)
+
+            self.assertIsNotNone(changed)
+            assert changed is not None
+            self.assertFalse(any("tracked.txt" in line for line in changed))
+            self.assertTrue(any("new.txt" in line for line in changed))
+
+    @unittest.skipUnless(shutil.which("git"), "git executable is required")
+    def test_changed_files_ignore_preexisting_dirty_file_when_index_status_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True)
+            tracked = root / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+            tracked.write_text("dirty before task\n", encoding="utf-8")
+
+            task = mysh.create_ai_task(root, "stage preexisting dirty file")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+
+            changed = mysh.changed_git_files_since_baseline(root, task.git_baseline)
+
+            self.assertIsNotNone(changed)
+            assert changed is not None
+            self.assertFalse(any("tracked.txt" in line for line in changed))
+
+    @unittest.skipUnless(shutil.which("git"), "git executable is required")
+    def test_changed_files_include_first_commit_from_unborn_repo_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True)
+
+            task = mysh.create_ai_task(root, "first commit")
+            (root / "first.txt").write_text("first\n", encoding="utf-8")
+            subprocess.run(["git", "add", "first.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+
+            changed = mysh.changed_git_files_since_baseline(root, task.git_baseline)
+
+            self.assertIsNotNone(changed)
+            assert changed is not None
+            self.assertTrue(any("first.txt" in line for line in changed))
+
+    @unittest.skipUnless(shutil.which("git"), "git executable is required")
+    def test_changed_files_filter_preexisting_staged_file_from_unborn_repo_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True)
+            (root / "before.txt").write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "before.txt"], cwd=root, check=True)
+
+            task = mysh.create_ai_task(root, "first commit with preexisting staged file")
+            (root / "after.txt").write_text("after\n", encoding="utf-8")
+            subprocess.run(["git", "add", "after.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+
+            changed = mysh.changed_git_files_since_baseline(root, task.git_baseline)
+
+            self.assertIsNotNone(changed)
+            assert changed is not None
+            self.assertFalse(any("before.txt" in line for line in changed))
+            self.assertTrue(any("after.txt" in line for line in changed))
+
+    def test_task_git_fields_are_omitted_outside_git_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch("mysh.is_git_repository", return_value=False):
+                task = mysh.create_ai_task(root, "no git")
+                changed = mysh.changed_git_files_since_baseline(root, task.git_baseline)
+
+            self.assertIsNone(task.git_baseline)
+            self.assertIsNone(changed)
+            self.assertNotIn("git_baseline", task.to_dict())
+            self.assertNotIn("changed_files", task.to_dict())
+
+
 class ShellConfigStoreTests(unittest.TestCase):
     def test_config_save_and_load_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -47,6 +47,8 @@ python mysh.py
 | `ai doctor` | Python·Git·Codex·Claude 환경 점검 |
 | `ai context [--mode debug\|review\|handoff] [--max-lines N]` | 기본/디버그/리뷰/인수인계용 plain-text 컨텍스트 팩 출력 |
 | `ai config` / `ai config reset` | 프로젝트별 theme, alias, 기본 AI tool/profile 설정 출력 / 초기화 |
+| `ai task new <goal>` / `ai task list` / `ai task show <id>` | AI 세션을 작업 단위로 묶고 Git baseline/변경 파일을 추적 |
+| `ai task current` / `ai task use <id>` / `ai task done <id> [--next N]` | 현재 작업 확인·전환·완료 처리 |
 | `ai sessions [--tool codex\|claude] [--failed]` | 저장된 AI 세션 목록, 도구별/실패 세션 필터 |
 | `ai show <id> [--json]` | 세션 상세 또는 스크립트용 JSON 메타데이터 |
 | `ai rerun <id>` | 저장된 세션의 tool/cwd/플래그로 새 세션 재실행 |
@@ -56,7 +58,7 @@ python mysh.py
 
 등록되지 않은 명령은 OS 셸 명령으로 실행을 시도합니다. `rm -rf`, `git reset --hard`, `DROP TABLE`처럼 명백히 위험한 패턴은 실행 직전 y/N 확인을 받으며, 파이프 같은 비대화형 입력에서는 자동으로 차단합니다. `!<명령>`은 고급 사용자용 escape hatch로 이 확인을 의도적으로 건너뜁니다. 이 정규식 블록리스트는 실수 방지용 과속방지턱일 뿐이며, 모든 위험 명령을 잡거나 우회를 막는 보안 경계가 아닙니다.
 
-AI 세션은 프로젝트 루트의 `.mysh/sessions.json`에 저장되며, **프롬프트 본문은 저장하지 않고** 유무·길이만 기록합니다. 프로젝트 설정은 `.mysh/config.json`에 저장됩니다. `ai rerun`은 대화를 이어가지 않고 저장된 실행 옵션으로 새 세션을 시작합니다.
+AI 세션은 프로젝트 루트의 `.mysh/sessions.json`에 저장되며, **프롬프트 본문은 저장하지 않고** 유무·길이만 기록합니다. 작업 메타데이터는 `.mysh/tasks.json`, 프로젝트 설정은 `.mysh/config.json`에 저장됩니다. JSON 저장소는 단일 사용자 사용을 가정하며 동시 사용은 지원하지 않습니다. `ai rerun`은 대화를 이어가지 않고 저장된 실행 옵션으로 새 세션을 시작합니다.
 
 ## 새 명령어 추가
 
