@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import ctypes
 import datetime as _dt
+import json
 import os
 import shutil
 import shlex
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 # -----------------------------------------------------------------------------
@@ -131,6 +133,226 @@ def command(name: str, description: str) -> Callable[[CommandHandler], CommandHa
 # -----------------------------------------------------------------------------
 
 
+def now_iso() -> str:
+    """사람이 읽기 쉬운 로컬 시간 ISO 문자열을 만든다."""
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def detect_project_root(start: Optional[Path] = None) -> Path:
+    """Git 루트가 있으면 그곳을, 없으면 현재 폴더를 프로젝트 루트로 쓴다."""
+    current = (start or Path.cwd()).resolve()
+    git = shutil.which("git")
+    if git:
+        try:
+            result = subprocess.run(
+                [git, "-C", str(current), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=3,
+                check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            result = None
+        if result and result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip()).resolve()
+
+    for candidate in [current, *current.parents]:
+        if (candidate / ".git").exists():
+            return candidate.resolve()
+    return current
+
+
+def is_git_project(root: Path) -> bool:
+    """주어진 루트가 Git 저장소인지 확인한다."""
+    root = root.resolve()
+    if (root / ".git").exists():
+        return True
+
+    git = shutil.which("git")
+    if not git:
+        return False
+    try:
+        result = subprocess.run(
+            [git, "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+            check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def gitignore_has_mysh(lines: List[str]) -> bool:
+    """이미 .mysh가 무시되고 있는지 느슨하게 판단한다."""
+    ignored_forms = {".mysh", ".mysh/", "/.mysh", "/.mysh/"}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped in ignored_forms:
+            return True
+    return False
+
+
+def ensure_mysh_gitignore(project_root: Path) -> None:
+    """Git 저장소라면 .mysh/가 .gitignore에 들어가도록 보장한다."""
+    if not is_git_project(project_root):
+        return
+
+    gitignore = project_root / ".gitignore"
+    try:
+        if gitignore.exists():
+            content = gitignore.read_text(encoding="utf-8", errors="replace")
+            lines = content.splitlines()
+            if gitignore_has_mysh(lines):
+                return
+            separator = "" if not content or content.endswith(("\n", "\r")) else "\n"
+            gitignore.write_text(f"{content}{separator}.mysh/\n", encoding="utf-8")
+        else:
+            gitignore.write_text(".mysh/\n", encoding="utf-8")
+    except OSError:
+        # 세션 기록 자체는 계속 가능해야 하므로 .gitignore 갱신 실패는 조용히 넘긴다.
+        return
+
+
+@dataclass
+class AiSession:
+    id: str
+    title: str
+    tool: str
+    cwd: str
+    command: str
+    profile: Optional[str]
+    created_at: str
+    updated_at: str
+    exit_code: Optional[int]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "tool": self.tool,
+            "cwd": self.cwd,
+            "command": self.command,
+            "profile": self.profile,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "exit_code": self.exit_code,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AiSession":
+        exit_code = data.get("exit_code")
+        if not isinstance(exit_code, int):
+            exit_code = None
+        return cls(
+            id=str(data.get("id", "")),
+            title=str(data.get("title", "")),
+            tool=str(data.get("tool", "")),
+            cwd=str(data.get("cwd", "")),
+            command=str(data.get("command", "")),
+            profile=data.get("profile") if data.get("profile") is None else str(data.get("profile")),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+            exit_code=exit_code,
+        )
+
+
+class AiSessionStore:
+    """프로젝트 루트 아래 .mysh/sessions.json을 관리한다."""
+
+    def __init__(self, project_root: Path):
+        self.project_root = Path(project_root).resolve()
+        self.store_dir = self.project_root / ".mysh"
+        self.path = self.store_dir / "sessions.json"
+        self.backup_path = self.store_dir / "sessions.json.bak"
+
+    def ensure_store_dir(self) -> None:
+        existed = self.store_dir.exists()
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            ensure_mysh_gitignore(self.project_root)
+
+    def load(self) -> List[AiSession]:
+        if not self.path.exists():
+            return []
+
+        try:
+            with self.path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            self.recover_corrupt_store()
+            return []
+
+        if isinstance(data, dict):
+            raw_sessions = data.get("sessions", [])
+        else:
+            raw_sessions = data
+
+        if not isinstance(raw_sessions, list):
+            self.recover_corrupt_store()
+            return []
+
+        sessions: List[AiSession] = []
+        for item in raw_sessions:
+            if not isinstance(item, dict):
+                continue
+            session = AiSession.from_dict(item)
+            if session.id:
+                sessions.append(session)
+        return sessions
+
+    def save(self, sessions: List[AiSession]) -> None:
+        self.ensure_store_dir()
+        payload = {"sessions": [session.to_dict() for session in sessions]}
+        tmp_path = self.path.with_suffix(".json.tmp")
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        tmp_path.replace(self.path)
+
+    def add(self, session: AiSession) -> None:
+        sessions = self.load()
+        sessions.append(session)
+        self.save(sessions)
+
+    def update(self, session: AiSession) -> None:
+        sessions = self.load()
+        for index, current in enumerate(sessions):
+            if current.id == session.id:
+                sessions[index] = session
+                self.save(sessions)
+                return
+        sessions.append(session)
+        self.save(sessions)
+
+    def get(self, session_id: str) -> Optional[AiSession]:
+        sessions = self.load()
+        for session in sessions:
+            if session.id == session_id:
+                return session
+
+        matches = [session for session in sessions if session.id.startswith(session_id)]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def recover_corrupt_store(self) -> None:
+        self.ensure_store_dir()
+        try:
+            if self.path.exists():
+                shutil.copy2(self.path, self.backup_path)
+        except OSError:
+            pass
+        self.save([])
+
+
 @dataclass
 class ShellContext:
     history: List[str] = field(default_factory=list)
@@ -144,6 +366,13 @@ class ShellContext:
     theme: str = "green"
     running: bool = True
     readline_available: bool = False
+    project_root: Path = field(default_factory=lambda: detect_project_root(Path.cwd()))
+    session_store: AiSessionStore = field(init=False)
+    active_profile: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.project_root = self.project_root.resolve()
+        self.session_store = AiSessionStore(self.project_root)
 
 
 class ShellExit(Exception):
@@ -155,6 +384,28 @@ def parse_args(raw_args: str) -> List[str]:
     if not raw_args.strip():
         return []
     return shlex.split(raw_args, posix=(os.name != "nt"))
+
+
+def parse_process_args(raw_args: str) -> List[str]:
+    """subprocess.run(list)에 넘길 인자를 OS 규칙대로 분해한다."""
+    if not raw_args.strip():
+        return []
+
+    if os.name != "nt":
+        return shlex.split(raw_args)
+
+    argc = ctypes.c_int()
+    command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+    command_line_to_argv.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    command_line_to_argv.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    argv = command_line_to_argv(raw_args, ctypes.byref(argc))
+    if not argv:
+        raise ValueError("Windows 명령줄을 해석할 수 없습니다.")
+
+    try:
+        return [argv[index] for index in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
 
 
 def split_command_line(line: str) -> tuple[str, str]:
@@ -205,6 +456,14 @@ def make_prompt(ctx: ShellContext) -> str:
 def print_error(message: str) -> None:
     """에러 메시지는 한곳에서 같은 형식으로 출력한다."""
     print(color(f"오류: {message}", Ansi.RED))
+
+
+def refresh_project_context(ctx: ShellContext) -> None:
+    """현재 cwd 기준 프로젝트 루트가 바뀌었으면 세션 저장소도 바꾼다."""
+    project_root = detect_project_root(Path.cwd())
+    if project_root != ctx.project_root:
+        ctx.project_root = project_root
+        ctx.session_store = AiSessionStore(project_root)
 
 
 def expand_alias(ctx: ShellContext, line: str) -> str:
@@ -545,6 +804,328 @@ def print_ai_context() -> None:
 
 
 # -----------------------------------------------------------------------------
+# AI 세션과 wrapper 실행
+# -----------------------------------------------------------------------------
+
+
+CODEX_CD_FLAGS = {"--cd", "-C"}
+LONG_FLAGS_WITH_VALUE = {
+    "--add-dir",
+    "--approval-policy",
+    "--ask-for-approval",
+    "--cd",
+    "--config",
+    "--cwd",
+    "--model",
+    "--output-format",
+    "--permission-mode",
+    "--profile",
+    "--sandbox",
+}
+CODEX_SHORT_FLAGS_WITH_VALUE = {"-C", "-a", "-c", "-i", "-m", "-p", "-s"}
+CLAUDE_SHORT_FLAGS_WITH_VALUE = {"-d", "-m", "-n", "-r", "-w"}
+
+
+def has_codex_cd_arg(args: List[str]) -> bool:
+    """사용자가 Codex 작업 디렉터리를 이미 지정했는지 확인한다."""
+    for arg in args:
+        if arg == "--":
+            return False
+        if arg in CODEX_CD_FLAGS or arg.startswith("--cd="):
+            return True
+    return False
+
+
+def build_codex_command(user_args: List[str], cwd: Path) -> List[str]:
+    """Codex 실행 명령을 만든다. --cd/-C가 없으면 현재 cwd를 넣는다."""
+    command_args = ["codex"]
+    if not has_codex_cd_arg(user_args):
+        command_args.extend(["--cd", str(cwd)])
+    command_args.extend(user_args)
+    return command_args
+
+
+def build_claude_command(user_args: List[str], cwd: Optional[Path] = None) -> List[str]:
+    """Claude 실행 명령을 만든다. cwd는 호출자가 subprocess.run(cwd=...)로 보장한다."""
+    _ = cwd
+    return ["claude", *user_args]
+
+
+def build_ai_command(tool: str, user_args: List[str], cwd: Path) -> List[str]:
+    if tool == "codex":
+        return build_codex_command(user_args, cwd)
+    if tool == "claude":
+        return build_claude_command(user_args, cwd)
+    raise ValueError(f"지원하지 않는 AI 도구입니다: {tool}")
+
+
+def resolve_executable_for_subprocess(executable: str) -> str:
+    """Windows에서 shell=False로 실행 가능한 shim을 우선 선택한다."""
+    if os.name != "nt":
+        return executable
+
+    runnable_extensions = [".exe", ".cmd", ".bat", ".com"]
+    executable_path = Path(executable)
+    has_directory = executable_path.parent != Path(".")
+
+    if has_directory:
+        if executable_path.suffix.lower() in {"", ".ps1"}:
+            base = executable_path.with_suffix("") if executable_path.suffix else executable_path
+            for extension in runnable_extensions:
+                candidate = base.with_suffix(extension)
+                if candidate.exists():
+                    return str(candidate)
+        return executable
+
+    for path_entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not path_entry:
+            continue
+        directory = Path(path_entry)
+        for extension in runnable_extensions:
+            candidate = directory / f"{executable}{extension}"
+            if candidate.exists():
+                return str(candidate)
+
+    found = shutil.which(executable)
+    if not found:
+        return executable
+
+    found_path = Path(found)
+    if found_path.suffix.lower() in {"", ".ps1"}:
+        base = found_path.with_suffix("") if found_path.suffix else found_path
+        for extension in runnable_extensions:
+            candidate = base.with_suffix(extension)
+            if candidate.exists():
+                return str(candidate)
+    return found
+
+
+def extract_long_option_value(args: List[str], name: str) -> Optional[str]:
+    """--name value 또는 --name=value 형태에서 값을 찾는다."""
+    for index, arg in enumerate(args):
+        if arg == "--":
+            return None
+        if arg == name and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(f"{name}="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def short_flags_with_value(tool: str) -> set[str]:
+    if tool == "codex":
+        return CODEX_SHORT_FLAGS_WITH_VALUE
+    if tool == "claude":
+        return CLAUDE_SHORT_FLAGS_WITH_VALUE
+    return set()
+
+
+def summarize_ai_command(tool: str, args: List[str]) -> str:
+    """프롬프트 본문을 제외한 안전한 명령 요약을 만든다."""
+    parts = [tool]
+    prompt_tokens: List[str] = []
+    value_short_flags = short_flags_with_value(tool)
+    index = 0
+
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            prompt_tokens.extend(args[index + 1 :])
+            break
+
+        if arg.startswith("--") and arg != "--":
+            name, separator, _value = arg.partition("=")
+            if separator:
+                parts.append(f"{name}=<value>")
+                index += 1
+                continue
+            if name in LONG_FLAGS_WITH_VALUE and index + 1 < len(args):
+                parts.append(f"{name} <value>")
+                index += 2
+                continue
+            parts.append(name)
+            index += 1
+            continue
+
+        if arg.startswith("-") and arg != "-":
+            if arg in value_short_flags and index + 1 < len(args):
+                parts.append(f"{arg} <value>")
+                index += 2
+                continue
+            parts.append(arg)
+            index += 1
+            continue
+
+        prompt_tokens.append(arg)
+        index += 1
+
+    prompt_text = " ".join(prompt_tokens)
+    prompt_note = f"prompt={'yes' if prompt_tokens else 'no'}, chars={len(prompt_text)}, args={len(prompt_tokens)}"
+    return f"{' '.join(parts)} [{prompt_note}]"
+
+
+def default_session_title(tool: str) -> str:
+    return f"{tool} session"
+
+
+def create_ai_session(tool: str, cwd: Path, command_args: List[str], title: Optional[str], profile: Optional[str]) -> AiSession:
+    timestamp = now_iso()
+    return AiSession(
+        id=uuid.uuid4().hex[:12],
+        title=title or default_session_title(tool),
+        tool=tool,
+        cwd=str(cwd),
+        command=summarize_ai_command(tool, command_args[1:]),
+        profile=profile,
+        created_at=timestamp,
+        updated_at=timestamp,
+        exit_code=None,
+    )
+
+
+def parse_ai_start_options(args: List[str]) -> tuple[Optional[str], Optional[str], List[str]]:
+    """ai start 전용 옵션을 떼고 실제 도구에 넘길 인자를 반환한다."""
+    title: Optional[str] = None
+    profile: Optional[str] = None
+    passthrough: List[str] = []
+    index = 0
+    option_mode = True
+
+    while index < len(args):
+        arg = args[index]
+        if option_mode and arg == "--":
+            passthrough.extend(args[index + 1 :])
+            break
+        if option_mode and arg == "--title":
+            if index + 1 >= len(args):
+                raise ValueError("--title에는 값이 필요합니다.")
+            title = args[index + 1]
+            index += 2
+            continue
+        if option_mode and arg.startswith("--title="):
+            title = arg.split("=", 1)[1]
+            index += 1
+            continue
+        if option_mode and arg == "--profile":
+            if index + 1 >= len(args):
+                raise ValueError("--profile에는 값이 필요합니다.")
+            profile = args[index + 1]
+            index += 2
+            continue
+        if option_mode and arg.startswith("--profile="):
+            profile = arg.split("=", 1)[1]
+            index += 1
+            continue
+
+        option_mode = False
+        passthrough.append(arg)
+        index += 1
+
+    return title, profile, passthrough
+
+
+def run_ai_tool_session(
+    ctx: ShellContext,
+    tool: str,
+    user_args: List[str],
+    title: Optional[str] = None,
+    profile: Optional[str] = None,
+) -> int:
+    """세션을 기록하고 TTY를 상속한 채 실제 Codex/Claude CLI를 실행한다."""
+    refresh_project_context(ctx)
+    cwd = Path.cwd().resolve()
+    session_profile = profile or extract_long_option_value(user_args, "--profile") or ctx.active_profile
+    if profile:
+        ctx.active_profile = profile
+
+    command_args = build_ai_command(tool, user_args, cwd)
+    session = create_ai_session(tool, cwd, command_args, title, session_profile)
+    ctx.session_store.add(session)
+    process_args = [resolve_executable_for_subprocess(command_args[0]), *command_args[1:]]
+
+    exit_code: Optional[int] = None
+    error_already_reported = False
+    try:
+        result = subprocess.run(process_args, cwd=str(cwd))
+        exit_code = result.returncode
+    except FileNotFoundError:
+        exit_code = 127
+        error_already_reported = True
+        print_error(f"{tool} 실행 파일을 PATH에서 찾지 못했습니다.")
+    except OSError as exc:
+        exit_code = 1
+        error_already_reported = True
+        print_error(f"{tool} 실행 중 문제가 발생했습니다: {exc}")
+    except KeyboardInterrupt:
+        exit_code = 130
+        raise
+    finally:
+        if exit_code is not None:
+            session.exit_code = exit_code
+            session.updated_at = now_iso()
+            ctx.session_store.update(session)
+
+    if exit_code and not error_already_reported:
+        print_error(f"{tool}가 종료 코드 {exit_code}로 끝났습니다.")
+    return exit_code or 0
+
+
+def shorten(text: str, max_length: int) -> str:
+    if len(text) <= max_length:
+        return text
+    if max_length <= 3:
+        return text[:max_length]
+    return text[: max_length - 3] + "..."
+
+
+def format_text_table(headers: List[str], rows: List[List[str]]) -> List[str]:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+
+    lines = ["  ".join(header.ljust(widths[index]) for index, header in enumerate(headers))]
+    lines.append("  ".join("-" * width for width in widths))
+    for row in rows:
+        lines.append("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+    return lines
+
+
+def print_ai_sessions(sessions: List[AiSession]) -> None:
+    if not sessions:
+        print("(저장된 AI 세션 없음)")
+        return
+
+    rows = []
+    for session in sorted(sessions, key=lambda item: item.updated_at, reverse=True):
+        rows.append(
+            [
+                session.id,
+                session.tool,
+                shorten(session.title, 28),
+                shorten(session.cwd, 36),
+                session.updated_at,
+                "-" if session.exit_code is None else str(session.exit_code),
+            ]
+        )
+
+    for line in format_text_table(["id", "tool", "title", "cwd", "updated_at", "exit"], rows):
+        print(line)
+
+
+def print_ai_session_detail(session: AiSession) -> None:
+    print(f"id: {session.id}")
+    print(f"title: {session.title}")
+    print(f"tool: {session.tool}")
+    print(f"cwd: {session.cwd}")
+    print(f"command: {session.command}")
+    print(f"profile: {session.profile or '-'}")
+    print(f"created_at: {session.created_at}")
+    print(f"updated_at: {session.updated_at}")
+    print(f"exit_code: {'-' if session.exit_code is None else session.exit_code}")
+
+
+# -----------------------------------------------------------------------------
 # 내장 명령어
 # -----------------------------------------------------------------------------
 
@@ -563,13 +1144,19 @@ def cmd_help(ctx: ShellContext, args: List[str], raw_args: str) -> None:
             print(f"  {name} -> {ctx.aliases[name]}")
 
 
-@command("ai", "AI 작업 보조 명령입니다. 예: ai doctor, ai context")
+@command("ai", "AI 작업 보조 명령입니다. 예: ai doctor, ai sessions, ai start codex")
 def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
-    if not args:
-        print("사용법: ai doctor | ai context")
+    try:
+        parsed_args = parse_process_args(raw_args)
+    except ValueError as exc:
+        print_error(f"인자를 해석할 수 없습니다: {exc}")
         return
 
-    subcommand = args[0].lower()
+    if not parsed_args:
+        print("사용법: ai doctor | ai context | ai sessions | ai show <session-id> | ai start <codex|claude> [옵션] [prompt...]")
+        return
+
+    subcommand = parsed_args[0].lower()
     if subcommand == "doctor":
         rows = [
             ("Python", STATUS_OK, sys.version.replace("\n", " ")),
@@ -585,8 +1172,66 @@ def cmd_ai(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         print_ai_context()
         return
 
+    if subcommand == "sessions":
+        refresh_project_context(ctx)
+        print_ai_sessions(ctx.session_store.load())
+        return
+
+    if subcommand == "show":
+        if len(parsed_args) < 2:
+            print_error("세션 id를 입력하세요.")
+            print("사용법: ai show <session-id>")
+            return
+        refresh_project_context(ctx)
+        session = ctx.session_store.get(parsed_args[1])
+        if not session:
+            print_error(f"세션을 찾을 수 없습니다: {parsed_args[1]}")
+            return
+        print_ai_session_detail(session)
+        return
+
+    if subcommand == "start":
+        if len(parsed_args) < 2:
+            print_error("실행할 AI 도구를 입력하세요.")
+            print("사용법: ai start <codex|claude> [--title T] [--profile P] [prompt...]")
+            return
+
+        tool = parsed_args[1].lower()
+        if tool not in {"codex", "claude"}:
+            print_error(f"지원하지 않는 AI 도구입니다: {tool}")
+            print("사용 가능: codex, claude")
+            return
+
+        try:
+            title, profile, passthrough_args = parse_ai_start_options(parsed_args[2:])
+        except ValueError as exc:
+            print_error(str(exc))
+            return
+        run_ai_tool_session(ctx, tool, passthrough_args, title=title, profile=profile)
+        return
+
     print_error(f"알 수 없는 ai 하위 명령입니다: {subcommand}")
-    print("사용법: ai doctor | ai context")
+    print("사용법: ai doctor | ai context | ai sessions | ai show <session-id> | ai start <codex|claude> [옵션] [prompt...]")
+
+
+@command("codex", "Codex CLI를 세션으로 기록한 뒤 실행합니다.")
+def cmd_codex(ctx: ShellContext, args: List[str], raw_args: str) -> None:
+    try:
+        user_args = parse_process_args(raw_args)
+    except ValueError as exc:
+        print_error(f"인자를 해석할 수 없습니다: {exc}")
+        return
+    run_ai_tool_session(ctx, "codex", user_args)
+
+
+@command("claude", "Claude CLI를 세션으로 기록한 뒤 실행합니다.")
+def cmd_claude(ctx: ShellContext, args: List[str], raw_args: str) -> None:
+    try:
+        user_args = parse_process_args(raw_args)
+    except ValueError as exc:
+        print_error(f"인자를 해석할 수 없습니다: {exc}")
+        return
+    run_ai_tool_session(ctx, "claude", user_args)
 
 
 @command("cd", "디렉터리를 이동합니다. 인자가 없으면 홈으로 이동합니다.")
@@ -602,6 +1247,7 @@ def cmd_cd(ctx: ShellContext, args: List[str], raw_args: str) -> None:
         return
 
     os.chdir(target)
+    refresh_project_context(ctx)
 
 
 @command("pwd", "현재 작업 디렉터리를 출력합니다.")

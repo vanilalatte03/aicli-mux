@@ -22,9 +22,18 @@ python mysh.py
 - `theme <green|blue|magenta|mono>` - 프롬프트 색상 변경
 - `alias 이름=명령` - 별칭 추가
 - `unalias <이름>` - 별칭 삭제
+- `ai doctor` - Python, Git, Codex, Claude 상태 확인
+- `ai context` - 현재 프로젝트의 README, 파일 트리, Git 요약 출력
+- `ai sessions` - `.mysh/sessions.json`에 저장된 AI 세션 목록 출력
+- `ai show <session-id>` - 저장된 AI 세션 상세 정보 출력
+- `ai start codex [--title T] [--profile P] [prompt...]` - 세션을 기록하고 Codex 실행
+- `ai start claude [--title T] [--profile P] [prompt...]` - 세션을 기록하고 Claude 실행
+- `codex ...`, `claude ...` - 세션을 먼저 기록한 뒤 실제 CLI에 위임
 - `exit`, `quit` - 셸 종료
 
 등록되지 않은 명령어는 실제 OS 셸 명령으로 실행을 시도합니다.
+
+AI 세션 기록은 프로젝트 루트의 `.mysh/sessions.json`에 저장됩니다. 프롬프트 본문은 저장하지 않고 유무와 길이만 기록합니다.
 
 ## 새 명령어 추가
 
