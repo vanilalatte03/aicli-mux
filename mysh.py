@@ -1115,6 +1115,7 @@ def test_command_hint_lines() -> List[str]:
 
 def iter_text_preview_files(root: Path, max_files: int = 250) -> List[Path]:
     """작은 텍스트 파일만 제한적으로 스캔한다."""
+    root = root.resolve()
     files: List[Path] = []
     for current, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(name for name in dirnames if name not in TREE_EXCLUDED_NAMES)
@@ -1122,15 +1123,20 @@ def iter_text_preview_files(root: Path, max_files: int = 250) -> List[Path]:
             if len(files) >= max_files:
                 return files
             path = Path(current) / filename
-            suffix = path.suffix.lower()
-            if suffix and suffix not in TEXT_PREVIEW_SUFFIXES:
-                continue
             try:
-                if path.stat().st_size > 200_000:
+                if path.is_symlink():
+                    continue
+                resolved = path.resolve()
+                if not path_is_under_root(resolved, root):
+                    continue
+                if resolved.stat().st_size > 200_000:
                     continue
             except OSError:
                 continue
-            files.append(path)
+            suffix = resolved.suffix.lower()
+            if suffix and suffix not in TEXT_PREVIEW_SUFFIXES:
+                continue
+            files.append(resolved)
     return files
 
 
