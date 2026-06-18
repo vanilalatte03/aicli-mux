@@ -53,8 +53,7 @@ python mysh.py
 | `ai sessions [--tool codex\|claude] [--failed]` | 저장된 AI 세션 목록, 도구별/실패 세션 필터 |
 | `ai show <id> [--json]` | 세션 상세 또는 스크립트용 JSON 메타데이터 |
 | `ai rerun <id>` | 저장된 세션의 tool/cwd/플래그로 새 세션 재실행 |
-| `ai start codex [--title T] [--profile P] [prompt...]` | 세션 기록 후 Codex 실행 |
-| `ai start claude [--title T] [--profile P] [prompt...]` | 세션 기록 후 Claude 실행 |
+| `ai start [codex\|claude] [--title T] [--profile P] [prompt...]` | 세션 기록 후 AI 도구 실행 (도구 생략 시 기본 AI tool 사용) |
 | `codex ...` / `claude ...` | 세션을 먼저 기록한 뒤 실제 CLI에 위임 |
 
 `ai context`는 active task가 있으면 출력 상단에 현재 작업(goal/변경 파일 요약)을 붙이고, `handoff`/`ship` 모드에서는 다음 액션·연결 세션·테스트 상태를 추가로 반영합니다.
@@ -63,7 +62,7 @@ python mysh.py
 
 정책 평가는 입력을 `;`, `&&`, `||`, `|` 기준의 세그먼트로 나눠 정규식과 대조합니다. POSIX 입력은 `shlex`, 그 외 환경은 따옴표만 고려하는 단순 분리를 사용하므로 셸 문법을 완전히 해석하지 않습니다. 이 정책은 실수 방지용 과속방지턱일 뿐이며, 모든 위험 명령을 잡거나 우회를 막는 보안 경계가 아닙니다.
 
-AI 세션은 프로젝트 루트의 `.mysh/sessions.json`에 저장되며, **프롬프트 본문은 저장하지 않고** 유무·길이만 기록합니다. 작업 메타데이터는 `.mysh/tasks.json`, 정책은 `.mysh/policy.json`, 프로젝트 설정은 `.mysh/config.json`에 저장됩니다. JSON 저장소는 단일 사용자 사용을 가정하며 동시 사용은 지원하지 않습니다. `ai rerun`은 대화를 이어가지 않고 저장된 실행 옵션으로 새 세션을 시작합니다.
+AI 세션은 프로젝트 루트의 `.mysh/sessions.json`에 저장되며, **프롬프트 본문은 저장하지 않고** 유무·길이만 기록합니다. 작업 메타데이터는 `.mysh/tasks.json`, 정책은 `.mysh/policy.json`, 프로젝트 설정은 `.mysh/config.json`에 저장됩니다. `--profile`을 지정하면 이후 Codex 실행의 기본 profile로 저장되고, 명시하지 않은 Codex 실행에도 적용됩니다. JSON 저장소는 단일 사용자 사용을 가정하며 동시 사용은 지원하지 않습니다. `ai rerun`은 대화를 이어가지 않고 저장된 실행 옵션으로 새 세션을 시작합니다.
 
 ## 새 명령어 추가
 

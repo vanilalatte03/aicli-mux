@@ -431,6 +431,18 @@ class AiCommandBuilderTests(unittest.TestCase):
 
         self.assertEqual(["--model", "sonnet"], args)
 
+    def test_codex_exec_summary_and_rerun_args_preserve_subcommand(self) -> None:
+        args = ["exec", "--model", "gpt-5", "write docs"]
+
+        summary = mysh.summarize_ai_command("codex", args)
+        rerunnable = mysh.extract_rerunnable_ai_args("codex", args)
+
+        self.assertIn("codex exec --model <value>", summary)
+        self.assertIn("prompt=yes", summary)
+        self.assertIn("chars=10", summary)
+        self.assertNotIn("write docs", summary)
+        self.assertEqual(["exec", "--model", "gpt-5"], rerunnable)
+
 
 class InputCompletionTests(unittest.TestCase):
     def test_normalize_input_line_removes_leading_bom(self) -> None:
@@ -849,7 +861,7 @@ class AiSessionCommandTests(unittest.TestCase):
 
             self.assertEqual(0, exit_code)
             run_mock.assert_called_once_with(
-                ["codex", "--cd", str(root.resolve()), "--model", "gpt-5"],
+                ["codex", "--cd", str(root.resolve()), "--profile", "default", "--model", "gpt-5"],
                 cwd=str(root.resolve()),
             )
             sessions = ctx.session_store.load()
@@ -857,7 +869,7 @@ class AiSessionCommandTests(unittest.TestCase):
             rerun = sessions[-1]
             self.assertEqual("rerun: codex session", rerun.title)
             self.assertEqual(0, rerun.exit_code)
-            self.assertEqual(["--model", "gpt-5"], rerun.args)
+            self.assertEqual(["--profile", "default", "--model", "gpt-5"], rerun.args)
 
     def test_run_ai_tool_session_persists_profile_from_user_args(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -882,6 +894,95 @@ class AiSessionCommandTests(unittest.TestCase):
             self.assertEqual("work", loaded.active_profile)
             sessions = loaded.session_store.load()
             self.assertEqual("work", sessions[-1].profile)
+
+    def test_run_ai_tool_session_applies_active_profile_to_process_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = mysh.ShellContext(project_root=root)
+            ctx.active_profile = "work"
+            completed = subprocess.CompletedProcess(["codex"], 0)
+
+            with mock.patch("mysh.refresh_project_context", lambda _ctx: None), mock.patch(
+                "mysh.resolve_executable_for_subprocess", return_value="codex"
+            ), mock.patch("mysh.ensure_mysh_gitignore", lambda _root: None), mock.patch(
+                "mysh.subprocess.run", return_value=completed
+            ) as run_mock:
+                mysh.run_ai_tool_session(ctx, "codex", ["--model", "gpt-5"], cwd_override=root)
+
+            run_mock.assert_called_once_with(
+                ["codex", "--cd", str(root.resolve()), "--profile", "work", "--model", "gpt-5"],
+                cwd=str(root.resolve()),
+            )
+            session = ctx.session_store.load()[-1]
+            self.assertEqual("work", session.profile)
+            self.assertEqual(["--profile", "work", "--model", "gpt-5"], session.args)
+
+    def test_ai_start_passes_profile_option_to_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = mysh.ShellContext(project_root=root)
+            completed = subprocess.CompletedProcess(["codex"], 0)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(root)
+                with mock.patch("mysh.refresh_project_context", lambda _ctx: None), mock.patch(
+                    "mysh.resolve_executable_for_subprocess", return_value="codex"
+                ), mock.patch("mysh.ensure_mysh_gitignore", lambda _root: None), mock.patch(
+                    "mysh.subprocess.run", return_value=completed
+                ) as run_mock:
+                    mysh.cmd_ai(ctx, [], "start codex --profile work --model gpt-5")
+            finally:
+                os.chdir(original_cwd)
+
+            run_mock.assert_called_once_with(
+                ["codex", "--cd", str(root.resolve()), "--profile", "work", "--model", "gpt-5"],
+                cwd=str(root.resolve()),
+            )
+            self.assertEqual("work", ctx.active_profile)
+
+    def test_active_profile_is_not_injected_into_claude_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = mysh.ShellContext(project_root=root)
+            ctx.active_profile = "work"
+            completed = subprocess.CompletedProcess(["claude"], 0)
+
+            with mock.patch("mysh.refresh_project_context", lambda _ctx: None), mock.patch(
+                "mysh.resolve_executable_for_subprocess", return_value="claude"
+            ), mock.patch("mysh.ensure_mysh_gitignore", lambda _root: None), mock.patch(
+                "mysh.subprocess.run", return_value=completed
+            ) as run_mock:
+                mysh.run_ai_tool_session(ctx, "claude", ["hello"], cwd_override=root)
+
+            run_mock.assert_called_once_with(["claude", "hello"], cwd=str(root.resolve()))
+            session = ctx.session_store.load()[-1]
+            self.assertEqual("work", session.profile)
+            self.assertEqual([], session.args)
+
+    def test_ai_start_uses_default_tool_when_tool_is_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = mysh.ShellContext(project_root=root)
+            ctx.default_ai_tool = "claude"
+            completed = subprocess.CompletedProcess(["claude"], 0)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(root)
+                with mock.patch("mysh.refresh_project_context", lambda _ctx: None), mock.patch(
+                    "mysh.resolve_executable_for_subprocess", return_value="claude"
+                ), mock.patch("mysh.ensure_mysh_gitignore", lambda _root: None), mock.patch(
+                    "mysh.subprocess.run", return_value=completed
+                ) as run_mock:
+                    mysh.cmd_ai(ctx, [], "start --title quick hello")
+            finally:
+                os.chdir(original_cwd)
+
+            run_mock.assert_called_once_with(["claude", "hello"], cwd=str(root.resolve()))
+            session = ctx.session_store.load()[-1]
+            self.assertEqual("claude", session.tool)
+            self.assertEqual("quick", session.title)
 
 
 class AiContextTests(unittest.TestCase):
